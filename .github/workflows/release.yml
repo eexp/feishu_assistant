@@ -114,6 +114,7 @@ jobs:
           pyinstaller --noconfirm --onedir --windowed \
             --name "FeishuAssistant" \
             --icon "icon.icns" \
+            --osx-bundle-identifier "com.feishu.assistant" \
             --add-data "api:api" \
             --add-data "ui:ui" \
             --add-data "utils:utils" \
@@ -147,9 +148,17 @@ jobs:
       - name: Package artifact (macOS)
         if: runner.os == 'macOS'
         run: |
-          cd dist
-          tar -czf "../${{ matrix.artifact_name }}.tar.gz" FeishuAssistant/
-          cd ..
+          # Debug: list dist contents
+          ls -la dist/
+          # Copy icon into .app bundle (ensure it's embedded)
+          if [ -f icon.icns ]; then
+            cp icon.icns dist/FeishuAssistant.app/Contents/Resources/icon-windowed.icns 2>/dev/null || true
+          fi
+          # Create DMG for easy distribution (double-click to install)
+          hdiutil create -volname "FeishuAssistant" \
+            -srcfolder "dist/FeishuAssistant.app" \
+            -ov -format UDZO \
+            "${{ matrix.artifact_name }}.dmg"
 
       - name: Package artifact (Linux)
         if: runner.os == 'Linux'
@@ -165,6 +174,7 @@ jobs:
           path: |
             ${{ matrix.artifact_name }}.zip
             ${{ matrix.artifact_name }}.tar.gz
+            ${{ matrix.artifact_name }}.dmg
           if-no-files-found: ignore
 
   release:
@@ -190,3 +200,4 @@ jobs:
           files: |
             artifacts/**/*.zip
             artifacts/**/*.tar.gz
+            artifacts/**/*.dmg
