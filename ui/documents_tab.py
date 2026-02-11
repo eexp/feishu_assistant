@@ -1,5 +1,6 @@
-"""文档 Tab：文档列表 + 内容预览"""
+"""文档 Tab：文档列表 + 内容预览 + URL/Token 直接打开"""
 
+import re
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -11,6 +12,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QSplitter,
     QLabel,
+    QGroupBox,
     QComboBox,
     QMessageBox,
 )
@@ -66,10 +68,41 @@ class DocumentsTab(QWidget):
         """设置 API 实例"""
         self._documents_api = documents_api
 
+    @staticmethod
+    def _extract_document_id(text: str) -> str:
+        """从 URL 或纯 token 中提取 document_id"""
+        text = text.strip()
+        if not text:
+            return ""
+        # 匹配 /docx/TOKEN 或 /docs/TOKEN 或 /wiki/TOKEN
+        for pattern in [r"/docx/([A-Za-z0-9_-]+)", r"/docs/([A-Za-z0-9_-]+)", r"/wiki/([A-Za-z0-9_-]+)"]:
+            m = re.search(pattern, text)
+            if m:
+                return m.group(1).split("?")[0]
+        # 如果没有匹配到 URL 模式，当做纯 token
+        return text.split("?")[0].split("/")[0]
+
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        # --- 顶部操作区 ---
+        # --- 快速打开区 ---
+        open_group = QGroupBox("🔗 通过链接/Token 打开文档")
+        open_layout = QHBoxLayout(open_group)
+
+        self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText(
+            "粘贴飞书文档 URL（如 https://xxx.feishu.cn/docx/xxx）或直接输入 Document ID"
+        )
+        self.url_input.returnPressed.connect(self._open_by_url)
+        open_layout.addWidget(self.url_input, 1)
+
+        self.open_url_btn = QPushButton("📖 打开")
+        self.open_url_btn.clicked.connect(self._open_by_url)
+        open_layout.addWidget(self.open_url_btn)
+
+        layout.addWidget(open_group)
+
+        # --- 文件浏览区 ---
         top_layout = QHBoxLayout()
 
         self.back_btn = QPushButton("⬅ 返回上级")
@@ -127,6 +160,27 @@ class DocumentsTab(QWidget):
         # --- 状态栏 ---
         self.status_label = QLabel("就绪 - 请先认证后刷新文件列表")
         layout.addWidget(self.status_label)
+
+    def _open_by_url(self):
+        """通过 URL 或 Token 直接打开文档"""
+        if not self._documents_api:
+            QMessageBox.warning(self, "提示", "请先完成认证")
+            return
+
+        text = self.url_input.text().strip()
+        if not text:
+            QMessageBox.warning(self, "提示", "请输入飞书文档链接或 Document ID")
+            return
+
+        document_id = self._extract_document_id(text)
+        if not document_id:
+            QMessageBox.warning(self, "提示", "无法解析出 Document ID，请检查输入")
+            return
+
+        self.doc_info_label.setText(f"文档: {document_id}")
+        self.doc_preview.setPlainText(f"正在加载文档 {document_id} ...")
+        self.status_label.setText(f"正在通过 Token 打开文档: {document_id}")
+        self._load_document_content(document_id)
 
     def _load_files(self, folder_token: str = ""):
         """加载文件列表"""

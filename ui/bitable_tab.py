@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal
 
+from ui.file_browser_dialog import FileBrowserDialog
+
 
 class ApiWorker(QThread):
     finished = Signal(object)
@@ -94,6 +96,7 @@ class BitableTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._bitable_api = None
+        self._drive_api = None
         self._worker = None
         self._current_app_token = ""
         self._current_table_id = ""
@@ -103,6 +106,11 @@ class BitableTab(QWidget):
 
     def set_api(self, bitable_api):
         self._bitable_api = bitable_api
+
+    def set_drive_api(self, drive_api):
+        """设置云盘 API（用于浏览选择多维表格）"""
+        self._drive_api = drive_api
+        self.browse_btn.setEnabled(True)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -120,6 +128,12 @@ class BitableTab(QWidget):
         self.open_btn = QPushButton("📂 打开")
         self.open_btn.clicked.connect(self._open_bitable)
         row1.addWidget(self.open_btn)
+
+        self.browse_btn = QPushButton("📁 浏览云盘")
+        self.browse_btn.setToolTip("从云盘中浏览选择多维表格")
+        self.browse_btn.clicked.connect(self._browse_from_drive)
+        self.browse_btn.setEnabled(False)
+        row1.addWidget(self.browse_btn)
 
         self.create_btn = QPushButton("➕ 新建")
         self.create_btn.clicked.connect(self._create_bitable)
@@ -421,6 +435,17 @@ class BitableTab(QWidget):
         self._worker.finished.connect(lambda _: self._load_records())
         self._worker.error.connect(self._on_api_error)
         self._worker.start()
+
+    def _browse_from_drive(self):
+        """从云盘浏览选择多维表格"""
+        if not self._drive_api:
+            QMessageBox.warning(self, "提示", "云盘 API 未初始化")
+            return
+        dlg = FileBrowserDialog(self._drive_api, file_type_filter="bitable", parent=self)
+        if dlg.exec() == QDialog.Accepted and dlg.selected_token:
+            self.token_input.setText(dlg.selected_token)
+            self.status_label.setText(f"已选择: {dlg.selected_name}")
+            self._open_bitable()
 
     def _on_api_error(self, error_msg):
         self.open_btn.setEnabled(True)
