@@ -22,9 +22,17 @@ from api.auth import FeishuAuth
 from api.contacts import ContactsAPI
 from api.messages import MessagesAPI
 from api.documents import DocumentsAPI
+from api.sheets import SheetsAPI
+from api.bitable import BitableAPI
+from api.drive import DriveAPI
+from api.calendar import CalendarAPI
 from ui.contacts_tab import ContactsTab
 from ui.messages_tab import MessagesTab
 from ui.documents_tab import DocumentsTab
+from ui.sheets_tab import SheetsTab
+from ui.bitable_tab import BitableTab
+from ui.drive_tab import DriveTab
+from ui.calendar_tab import CalendarTab
 from ui.permissions_tab import PermissionsTab
 from utils.config_manager import get_credentials, save_credentials
 
@@ -199,13 +207,20 @@ class MainWindow(QMainWindow):
         self.contacts_tab = ContactsTab()
         self.messages_tab = MessagesTab()
         self.documents_tab = DocumentsTab()
+        self.sheets_tab = SheetsTab()
+        self.bitable_tab = BitableTab()
+        self.drive_tab = DriveTab()
+        self.calendar_tab = CalendarTab()
         self.permissions_tab = PermissionsTab()
 
         self.tabs.addTab(self.permissions_tab, "🔐 权限检测")
         self.tabs.addTab(self.contacts_tab, "👥 联系人")
         self.tabs.addTab(self.messages_tab, "💬 消息")
         self.tabs.addTab(self.documents_tab, "📄 文档")
-        
+        self.tabs.addTab(self.sheets_tab, "📊 表格")
+        self.tabs.addTab(self.bitable_tab, "📋 多维表格")
+        self.tabs.addTab(self.drive_tab, "📁 云盘")
+        self.tabs.addTab(self.calendar_tab, "📅 日历")
 
         # 初始禁用 Tab
         self.tabs.setEnabled(False)
@@ -282,10 +297,18 @@ class MainWindow(QMainWindow):
         contacts_api = ContactsAPI(self._auth)
         messages_api = MessagesAPI(self._auth)
         documents_api = DocumentsAPI(self._auth)
+        sheets_api = SheetsAPI(self._auth)
+        bitable_api = BitableAPI(self._auth)
+        drive_api = DriveAPI(self._auth)
+        calendar_api = CalendarAPI(self._auth)
 
         self.contacts_tab.set_api(contacts_api)
         self.messages_tab.set_api(messages_api)
         self.documents_tab.set_api(documents_api)
+        self.sheets_tab.set_api(sheets_api)
+        self.bitable_tab.set_api(bitable_api)
+        self.drive_tab.set_api(drive_api)
+        self.calendar_tab.set_api(calendar_api)
         self.permissions_tab.set_auth(self._auth)
 
     def _load_bot_avatar(self, url: str):

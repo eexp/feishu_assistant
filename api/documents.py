@@ -1,5 +1,6 @@
 """飞书文档 API 封装"""
 
+import json
 from api.auth import FeishuAuth
 
 
@@ -119,4 +120,136 @@ class DocumentsAPI:
                     }
                 ]
             },
+        )
+
+    # ── 文档创建与写入 ──────────────────────────
+
+    def create_document(self, title: str, folder_token: str = "") -> dict:
+        """
+        创建空文档 (docx)
+
+        :param title: 文档标题
+        :param folder_token: 目标文件夹 token，空表示根目录
+        :return: API 响应数据（含 document_id）
+        """
+        payload = {"title": title}
+        if folder_token:
+            payload["folder_token"] = folder_token
+        return self.auth.request("POST", "/docx/v1/documents", json=payload)
+
+    def create_document_with_content(self, title: str, content: str, folder_token: str = "") -> dict:
+        """
+        创建文档并写入文本内容
+
+        :param title: 文档标题
+        :param content: 文本内容（多行会自动按行创建文本块）
+        :param folder_token: 目标文件夹 token
+        :return: 包含 document_id 和 url 的结果
+        """
+        # 1. 创建文档
+        result = self.create_document(title, folder_token)
+        doc_id = result.get("data", {}).get("document", {}).get("document_id", "")
+        if not doc_id:
+            return result
+
+        # 2. 写入内容
+        if content:
+            self._append_text_blocks(doc_id, content)
+
+        return {
+            "code": 0,
+            "data": {
+                "document_id": doc_id,
+                "url": f"https://feishu.cn/docx/{doc_id}",
+                "title": title,
+            },
+        }
+
+    def append_content(self, document_id: str, content: str) -> dict:
+        """
+        向文档追加文本内容
+
+        :param document_id: 文档 ID
+        :param content: 要追加的文本内容
+        :return: API 响应数据
+        """
+        return self._append_text_blocks(document_id, content)
+
+    def _append_text_blocks(self, document_id: str, content: str) -> dict:
+        """
+        向文档追加文本块（每行一个段落）
+
+        :param document_id: 文档 ID
+        :param content: 文本内容
+        :return: API 响应数据
+        """
+        children = []
+        for line in content.split("\n"):
+            children.append({
+                "block_type": 2,  # text block
+                "text": {
+                    "elements": [
+                        {"text_run": {"content": line}}
+                    ]
+                },
+            })
+
+        payload = {"children": children}
+        return self.auth.request(
+            "POST",
+            f"/docx/v1/documents/{document_id}/blocks/{document_id}/children",
+            json=payload,
+        )
+
+    def get_document_blocks(self, document_id: str, page_token: str = "") -> dict:
+        """
+        获取文档的所有块（分页）
+
+        :param document_id: 文档 ID
+        :param page_token: 分页 token
+        :return: API 响应数据
+        """
+        params = {"page_size": 500, "document_revision_id": -1}
+        if page_token:
+            params["page_token"] = page_token
+
+        return self.auth.request(
+            "GET",
+            f"/docx/v1/documents/{document_id}/blocks",
+            params=params,
+        )
+
+    def get_all_blocks(self, document_id: str) -> list[dict]:
+        """
+        获取文档所有块（自动分页）
+
+        :param document_id: 文档 ID
+        :return: 块列表
+        """
+        all_blocks = []
+        page_token = ""
+
+        while True:
+            data = self.get_document_blocks(document_id, page_token)
+            items = data.get("data", {}).get("items", [])
+            all_blocks.extend(items)
+
+            if not data.get("data", {}).get("has_more", False):
+                break
+            page_token = data.get("data", {}).get("page_token", "")
+
+        return all_blocks
+
+    def delete_block(self, document_id: str, block_id: str) -> dict:
+        """
+        删除文档中的指定块
+
+        :param document_id: 文档 ID
+        :param block_id: 块 ID
+        :return: API 响应数据
+        """
+        return self.auth.request(
+            "DELETE",
+            f"/docx/v1/documents/{document_id}/blocks/{block_id}",
+            params={"document_revision_id": -1},
         )
