@@ -1,5 +1,7 @@
-"""消息 Tab：选择接收人 + 编辑消息 + 发送"""
+"""消息 Tab：左侧选择消息对象 + 右侧聊天框与发送"""
 
+import json
+import time
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -13,8 +15,13 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QSplitter,
+    QScrollArea,
+    QSizePolicy,
+    QFrame,
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QFont, QColor, QTextCursor
 
 
 class ApiWorker(QThread):
@@ -41,10 +48,6 @@ def text_to_post(text: str, title: str = "") -> dict:
     """
     将纯文本转换为飞书富文本 post 格式。
     每行文本作为一个段落，空行保留。
-
-    :param text: 纯文本内容
-    :param title: 富文本标题（可选）
-    :return: post 格式的字典
     """
     lines = text.split("\n")
     content = []
@@ -52,7 +55,6 @@ def text_to_post(text: str, title: str = "") -> dict:
         if line.strip():
             content.append([{"tag": "text", "text": line}])
         else:
-            # 空行作为空段落
             content.append([{"tag": "text", "text": ""}])
 
     return {
@@ -63,13 +65,77 @@ def text_to_post(text: str, title: str = "") -> dict:
     }
 
 
+def _parse_msg_content(msg: dict) -> str:
+    """从消息体中提取可读文本"""
+    msg_type = msg.get("msg_type", "")
+    body = msg.get("body", {})
+    content_str = body.get("content", "{}")
+
+    try:
+        content = json.loads(content_str)
+    except (json.JSONDecodeError, TypeError):
+        content = {}
+
+    if msg_type == "text":
+        return content.get("text", content_str)
+    elif msg_type == "post":
+        # 富文本：提取所有 text 标签的文本
+        parts = []
+        zh = content.get("zh_cn", content.get("en_us", {}))
+        title = zh.get("title", "")
+        if title:
+            parts.append(f"[{title}]")
+        for paragraph in zh.get("content", []):
+            line_parts = []
+            for elem in paragraph:
+                tag = elem.get("tag", "")
+                if tag == "text":
+                    line_parts.append(elem.get("text", ""))
+                elif tag == "a":
+                    line_parts.append(elem.get("text", "") + f"({elem.get('href', '')})")
+                elif tag == "at":
+                    line_parts.append(f"@{elem.get('user_name', elem.get('user_id', ''))}")
+                elif tag == "img":
+                    line_parts.append("[图片]")
+                elif tag == "media":
+                    line_parts.append("[媒体]")
+            parts.append("".join(line_parts))
+        return "\n".join(parts)
+    elif msg_type == "image":
+        return "[图片消息]"
+    elif msg_type == "file":
+        return f"[文件] {content.get('file_name', '')}"
+    elif msg_type == "audio":
+        return "[语音消息]"
+    elif msg_type == "sticker":
+        return "[表情]"
+    elif msg_type == "interactive":
+        # 卡片消息
+        header = content.get("header", {})
+        title = header.get("title", {}).get("content", "")
+        return f"[卡片] {title}" if title else "[卡片消息]"
+    elif msg_type == "share_chat":
+        return f"[分享群聊] {content.get('chat_name', '')}"
+    elif msg_type == "share_user":
+        return "[分享名片]"
+    elif msg_type == "system":
+        return "[系统消息]"
+    elif msg_type == "merge_forward":
+        return "[合并转发]"
+    else:
+        return f"[{msg_type}]"
+
+
 class MessagesTab(QWidget):
-    """消息发送 Tab"""
+    """消息 Tab - 左侧选择对象，右侧聊天与发送"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._messages_api = None
         self._worker = None
+        self._current_chat_id = None
+        self._current_chat_name = ""
+        self._chat_data_cache = {}  # chat_id -> chat info
         self._setup_ui()
 
     def set_api(self, messages_api):
@@ -77,130 +143,229 @@ class MessagesTab(QWidget):
         self._messages_api = messages_api
 
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(4)
 
-        # --- 接收对象区域 ---
-        target_group = QGroupBox("消息接收对象")
-        target_layout = QVBoxLayout(target_group)
+        # ===== 左侧面板：消息对象选择 (20%) =====
+        left_panel = QWidget()
+        left_panel.setMinimumWidth(200)
+        left_panel.setMaximumWidth(350)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_layout.setSpacing(6)
 
-        # 接收类型选择
-        type_layout = QHBoxLayout()
-        type_layout.addWidget(QLabel("接收类型:"))
-        self.receive_type_combo = QComboBox()
-        self.receive_type_combo.addItems(["open_id (用户)", "chat_id (群)", "user_id (用户ID)", "email (邮箱)"])
-        self.receive_type_combo.currentIndexChanged.connect(self._on_type_changed)
-        type_layout.addWidget(self.receive_type_combo)
+        # 标题
+        left_title = QLabel("💬 消息对象")
+        left_title.setFont(QFont("", 13, QFont.Bold))
+        left_layout.addWidget(left_title)
 
-        # 加载群列表按钮（紧贴在接收类型右边，仅群模式可见）
-        self.load_chats_btn = QPushButton("📋 加载群列表")
+        # 加载群列表按钮
+        self.load_chats_btn = QPushButton("🔄 加载会话列表")
         self.load_chats_btn.clicked.connect(self._load_chats)
-        self.load_chats_btn.setVisible(False)
-        type_layout.addWidget(self.load_chats_btn)
+        left_layout.addWidget(self.load_chats_btn)
 
-        type_layout.addStretch()
-        target_layout.addLayout(type_layout)
+        # 搜索框
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("🔍 搜索群聊/会话...")
+        self.search_input.textChanged.connect(self._filter_chat_list)
+        left_layout.addWidget(self.search_input)
 
-        # ID 输入
-        id_layout = QHBoxLayout()
-        id_layout.addWidget(QLabel("接收者 ID:"))
-        self.receive_id_input = QLineEdit()
-        self.receive_id_input.setPlaceholderText("输入接收者的 open_id / chat_id / user_id / email")
-        id_layout.addWidget(self.receive_id_input)
-        target_layout.addLayout(id_layout)
-
+        # 会话列表
         self.chat_list = QListWidget()
-        self.chat_list.setMaximumHeight(150)
+        self.chat_list.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background: #fafafa;
+            }
+            QListWidget::item {
+                padding: 8px 6px;
+                border-bottom: 1px solid #eee;
+            }
+            QListWidget::item:selected {
+                background: #e3f2fd;
+                color: #1565c0;
+            }
+            QListWidget::item:hover {
+                background: #f0f0f0;
+            }
+        """)
         self.chat_list.itemClicked.connect(self._on_chat_selected)
-        self.chat_list.setVisible(False)
-        target_layout.addWidget(self.chat_list)
+        left_layout.addWidget(self.chat_list)
 
-        layout.addWidget(target_group)
+        # 手动输入 ID 区域
+        manual_group = QGroupBox("手动指定")
+        manual_layout = QVBoxLayout(manual_group)
 
-        # --- 消息编辑区域 ---
-        msg_group = QGroupBox("消息内容")
-        msg_layout = QVBoxLayout(msg_group)
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("类型:"))
+        self.receive_type_combo = QComboBox()
+        self.receive_type_combo.addItems(["chat_id (群)", "open_id (用户)", "user_id", "email"])
+        type_row.addWidget(self.receive_type_combo)
+        manual_layout.addLayout(type_row)
 
-        # 消息类型
-        msg_type_layout = QHBoxLayout()
-        msg_type_layout.addWidget(QLabel("消息类型:"))
+        self.manual_id_input = QLineEdit()
+        self.manual_id_input.setPlaceholderText("输入 chat_id / open_id / ...")
+        manual_layout.addWidget(self.manual_id_input)
+
+        self.manual_open_btn = QPushButton("📨 打开会话")
+        self.manual_open_btn.clicked.connect(self._on_manual_open)
+        manual_layout.addWidget(self.manual_open_btn)
+
+        left_layout.addWidget(manual_group)
+
+        # 状态标签
+        self.left_status = QLabel("请加载会话列表")
+        self.left_status.setStyleSheet("color: #888; font-size: 11px;")
+        left_layout.addWidget(self.left_status)
+
+        main_layout.addWidget(left_panel, 2)  # stretch factor 2 (≈20%)
+
+        # ===== 右侧面板：聊天区域 (80%) =====
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(4, 4, 4, 4)
+        right_layout.setSpacing(6)
+
+        # 聊天标题栏
+        header_layout = QHBoxLayout()
+        self.chat_title_label = QLabel("请选择一个会话")
+        self.chat_title_label.setFont(QFont("", 14, QFont.Bold))
+        header_layout.addWidget(self.chat_title_label)
+        header_layout.addStretch()
+
+        self.refresh_btn = QPushButton("🔄 刷新消息")
+        self.refresh_btn.clicked.connect(self._load_messages)
+        self.refresh_btn.setEnabled(False)
+        header_layout.addWidget(self.refresh_btn)
+
+        right_layout.addLayout(header_layout)
+
+        # 分割线
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        right_layout.addWidget(line)
+
+        # 聊天记录显示区域（上方大区域）
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setStyleSheet("""
+            QTextEdit {
+                background: #f9f9f9;
+                border: 1px solid #ddd;
+                border-radius: 6px;
+                padding: 8px;
+                font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+                font-size: 13px;
+            }
+        """)
+        self.chat_display.setPlaceholderText(
+            "选择左侧的会话对象后，历史消息将显示在这里...\n\n"
+            "• 点击左侧群聊/会话加载历史消息\n"
+            "• 也可以手动输入 ID 打开会话"
+        )
+        right_layout.addWidget(self.chat_display, 7)  # stretch factor 7
+
+        # ===== 发送区域（下方小区域） =====
+        send_group = QGroupBox("发送消息")
+        send_layout = QVBoxLayout(send_group)
+
+        # 消息类型选择（单行）
+        msg_type_row = QHBoxLayout()
+        msg_type_row.addWidget(QLabel("类型:"))
         self.msg_type_combo = QComboBox()
         self.msg_type_combo.addItems(["文本消息", "富文本消息", "卡片消息 (JSON)"])
         self.msg_type_combo.currentIndexChanged.connect(self._on_msg_type_changed)
-        msg_type_layout.addWidget(self.msg_type_combo)
-        msg_layout.addLayout(msg_type_layout)
+        msg_type_row.addWidget(self.msg_type_combo)
 
-        # 富文本标题（仅富文本模式显示）
-        self.title_layout = QHBoxLayout()
+        # 富文本标题（仅富文本时显示）
         self.title_label = QLabel("标题:")
         self.title_input = QLineEdit()
-        self.title_input.setPlaceholderText("富文本消息标题（可选）")
-        self.title_layout.addWidget(self.title_label)
-        self.title_layout.addWidget(self.title_input)
+        self.title_input.setPlaceholderText("富文本标题（可选）")
         self.title_label.setVisible(False)
         self.title_input.setVisible(False)
-        msg_layout.addLayout(self.title_layout)
+        msg_type_row.addWidget(self.title_label)
+        msg_type_row.addWidget(self.title_input)
 
-        # 消息内容
-        self.msg_content = QTextEdit()
-        self.msg_content.setPlaceholderText(
-            "输入消息内容...\n\n"
-            "• 文本消息：直接输入文字\n"
-            "• 富文本消息：直接输入文字，支持多行，每行自动成为一个段落\n"
-            "• 卡片消息：输入 JSON 格式的卡片内容"
-        )
-        self.msg_content.setMinimumHeight(200)
-        msg_layout.addWidget(self.msg_content)
+        msg_type_row.addStretch()
+        send_layout.addLayout(msg_type_row)
 
-        layout.addWidget(msg_group)
+        # 输入区域 + 发送按钮（横排）
+        input_row = QHBoxLayout()
+        self.msg_input = QTextEdit()
+        self.msg_input.setMaximumHeight(80)
+        self.msg_input.setMinimumHeight(50)
+        self.msg_input.setPlaceholderText("输入消息... (Ctrl+Enter 发送)")
+        self.msg_input.setStyleSheet("""
+            QTextEdit {
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                padding: 4px;
+            }
+        """)
+        input_row.addWidget(self.msg_input, 1)
 
-        # --- 发送按钮 ---
-        send_layout = QHBoxLayout()
-        send_layout.addStretch()
-        self.send_btn = QPushButton("📤 发送消息")
-        self.send_btn.setMinimumWidth(150)
-        self.send_btn.setMinimumHeight(40)
+        self.send_btn = QPushButton("📤 发送")
+        self.send_btn.setMinimumWidth(80)
+        self.send_btn.setMinimumHeight(50)
+        self.send_btn.setStyleSheet("""
+            QPushButton {
+                background: #1677ff;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #4096ff;
+            }
+            QPushButton:pressed {
+                background: #0958d9;
+            }
+            QPushButton:disabled {
+                background: #bbb;
+            }
+        """)
         self.send_btn.clicked.connect(self._on_send)
-        send_layout.addWidget(self.send_btn)
-        layout.addLayout(send_layout)
+        self.send_btn.setEnabled(False)
+        input_row.addWidget(self.send_btn)
 
-        # --- 状态栏 ---
-        self.status_label = QLabel("就绪 - 填写接收者和消息内容后发送")
-        layout.addWidget(self.status_label)
+        send_layout.addLayout(input_row)
 
-    def _on_msg_type_changed(self, index):
-        """消息类型切换"""
-        is_rich = index == 1  # 富文本
-        self.title_label.setVisible(is_rich)
-        self.title_input.setVisible(is_rich)
+        right_layout.addWidget(send_group, 2)  # stretch factor 2
 
-        placeholders = {
-            0: "输入消息内容...\n\n直接输入文字即可。",
-            1: "输入富文本消息内容...\n\n直接输入文字，支持多行。\n每行自动成为一个段落。",
-            2: "输入卡片消息 JSON...\n\n请输入完整的卡片 JSON 格式内容。",
-        }
-        self.msg_content.setPlaceholderText(placeholders.get(index, ""))
+        # 状态栏
+        self.status_label = QLabel("就绪 - 选择左侧的会话开始聊天")
+        self.status_label.setStyleSheet("color: #666; font-size: 11px;")
+        right_layout.addWidget(self.status_label)
 
-    def _on_type_changed(self, index):
-        """接收类型切换"""
-        is_chat = index == 1  # chat_id
-        self.chat_list.setVisible(is_chat and self.chat_list.count() > 0)
-        self.load_chats_btn.setVisible(is_chat)
+        main_layout.addWidget(right_panel, 8)  # stretch factor 8 (≈80%)
 
-        type_map = {
-            0: "输入接收者的 open_id",
-            1: "输入群的 chat_id，或从下方列表选择",
-            2: "输入接收者的 user_id",
-            3: "输入接收者的邮箱地址",
-        }
-        self.receive_id_input.setPlaceholderText(type_map.get(index, ""))
+        # Ctrl+Enter 快捷发送
+        self.msg_input.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        """拦截 Ctrl+Enter 快捷发送"""
+        from PySide6.QtCore import QEvent
+        if obj == self.msg_input and event.type() == QEvent.KeyPress:
+            from PySide6.QtCore import Qt as QtKey
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
+                self._on_send()
+                return True
+        return super().eventFilter(obj, event)
+
+    # ─── 左侧面板：会话列表 ─────────────────────
 
     def _load_chats(self):
-        """加载群列表"""
+        """加载机器人所在的群列表"""
         if not self._messages_api:
             QMessageBox.warning(self, "提示", "请先完成认证")
             return
 
-        self.status_label.setText("正在加载群列表...")
+        self.left_status.setText("正在加载会话列表...")
         self.load_chats_btn.setEnabled(False)
 
         self._worker = ApiWorker(self._messages_api.get_all_chats)
@@ -211,28 +376,216 @@ class MessagesTab(QWidget):
     def _on_chats_loaded(self, chats):
         """群列表加载完成"""
         self.chat_list.clear()
-        self.chat_list.setVisible(True)
+        self._chat_data_cache.clear()
 
         for chat in chats:
-            name = chat.get("name", "未命名群")
+            name = chat.get("name", "未命名会话")
             chat_id = chat.get("chat_id", "")
+            chat_type = chat.get("chat_mode", "")
             description = chat.get("description", "")
-            item = QListWidgetItem(f"{name}  [{chat_id[:16]}...]")
+            owner_id = chat.get("owner_id", "")
+            member_count = chat.get("user_count", "")
+
+            # 图标区分群聊和单聊
+            icon = "👥" if chat_type != "p2p" else "👤"
+            display_text = f"{icon} {name}"
+            if member_count:
+                display_text += f" ({member_count}人)"
+
+            item = QListWidgetItem(display_text)
             item.setData(Qt.UserRole, chat_id)
-            item.setToolTip(f"群名: {name}\nID: {chat_id}\n描述: {description}")
+            item.setData(Qt.UserRole + 1, name)
+            item.setToolTip(
+                f"会话名: {name}\n"
+                f"ID: {chat_id}\n"
+                f"类型: {chat_type}\n"
+                f"描述: {description}\n"
+                f"成员数: {member_count}"
+            )
             self.chat_list.addItem(item)
 
-        self.status_label.setText(f"已加载 {len(chats)} 个群")
+            # 缓存
+            self._chat_data_cache[chat_id] = chat
+
+        self.left_status.setText(f"已加载 {len(chats)} 个会话")
         self.load_chats_btn.setEnabled(True)
 
-    def _on_chat_selected(self, item):
-        """选择群 - 自动切换接收类型为 chat_id"""
-        chat_id = item.data(Qt.UserRole)
-        self.receive_id_input.setText(chat_id)
-        # 自动切换到 chat_id 类型
-        self.receive_type_combo.setCurrentIndex(1)
+    def _filter_chat_list(self, text):
+        """搜索过滤会话列表"""
+        text = text.strip().lower()
+        for i in range(self.chat_list.count()):
+            item = self.chat_list.item(i)
+            if text:
+                item.setHidden(text not in item.text().lower())
+            else:
+                item.setHidden(False)
 
-    def _auto_detect_id_type(self, receive_id: str) -> str:
+    def _on_chat_selected(self, item):
+        """选择一个会话"""
+        chat_id = item.data(Qt.UserRole)
+        chat_name = item.data(Qt.UserRole + 1)
+        self._open_chat(chat_id, chat_name)
+
+    def _on_manual_open(self):
+        """手动输入 ID 打开会话"""
+        raw_id = self.manual_id_input.text().strip()
+        if not raw_id:
+            QMessageBox.warning(self, "提示", "请输入 ID")
+            return
+
+        type_index = self.receive_type_combo.currentIndex()
+        type_map = {0: "chat_id", 1: "open_id", 2: "user_id", 3: "email"}
+        id_type = type_map.get(type_index, "chat_id")
+
+        if id_type == "chat_id":
+            self._open_chat(raw_id, f"会话 {raw_id[:12]}...")
+        else:
+            # 非 chat_id 类型：直接设置为当前对象，不加载历史（因为需要 chat_id 才能获取历史）
+            self._current_chat_id = raw_id
+            self._current_chat_name = f"{id_type}: {raw_id[:16]}..."
+            self._current_id_type = id_type
+            self.chat_title_label.setText(f"📨 {self._current_chat_name}")
+            self.chat_display.clear()
+            self.chat_display.setPlaceholderText(
+                f"已选择 {id_type} 类型的接收者: {raw_id}\n\n"
+                "注意：非 chat_id 类型无法加载历史消息，但可以发送消息。"
+            )
+            self.send_btn.setEnabled(True)
+            self.refresh_btn.setEnabled(False)
+            self.status_label.setText(f"已选择 {id_type}: {raw_id}")
+
+    def _open_chat(self, chat_id: str, chat_name: str):
+        """打开一个聊天会话"""
+        self._current_chat_id = chat_id
+        self._current_chat_name = chat_name
+        self._current_id_type = "chat_id"
+        self.chat_title_label.setText(f"💬 {chat_name}")
+        self.send_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+        self.manual_id_input.setText(chat_id)
+        self.receive_type_combo.setCurrentIndex(0)
+
+        # 加载历史消息
+        self._load_messages()
+
+    def _load_messages(self):
+        """加载当前会话的历史消息"""
+        if not self._messages_api or not self._current_chat_id:
+            return
+
+        if getattr(self, '_current_id_type', 'chat_id') != "chat_id":
+            return
+
+        self.status_label.setText("正在加载历史消息...")
+        self.refresh_btn.setEnabled(False)
+
+        self._worker = ApiWorker(
+            self._messages_api.get_all_chat_messages,
+            self._current_chat_id,
+            max_count=100,
+        )
+        self._worker.finished.connect(self._on_messages_loaded)
+        self._worker.error.connect(self._on_api_error)
+        self._worker.start()
+
+    @staticmethod
+    def _escape_html(text: str) -> str:
+        """转义 HTML 特殊字符"""
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("\n", "<br/>")
+        )
+
+    def _format_message_html(self, time_str: str, sender_display: str, text: str, is_app: bool = False) -> str:
+        """将单条消息格式化为 HTML 片段"""
+        escaped_text = self._escape_html(text)
+        sender_color = "#1677ff" if is_app else "#333"
+        return (
+            f'<div style="margin-bottom:10px;">'
+            f'  <div style="font-size:11px; color:#999;">{self._escape_html(time_str)}</div>'
+            f'  <div style="font-size:13px; font-weight:bold; color:{sender_color}; margin:2px 0;">'
+            f'    {self._escape_html(sender_display)}'
+            f'  </div>'
+            f'  <div style="font-size:13px; color:#333; line-height:1.6; padding-left:4px;">'
+            f'    {escaped_text}'
+            f'  </div>'
+            f'</div>'
+        )
+
+    def _on_messages_loaded(self, messages):
+        """历史消息加载完成"""
+        self.chat_display.clear()
+        self.refresh_btn.setEnabled(True)
+
+        if not messages:
+            self.chat_display.setPlainText("（暂无消息记录）")
+            self.status_label.setText(f"会话 [{self._current_chat_name}] 暂无消息")
+            return
+
+        html_parts = [
+            '<div style="font-family: -apple-system, \'Segoe UI\', \'PingFang SC\', '
+            '\'Microsoft YaHei\', sans-serif;">'
+        ]
+
+        # 按时间正序显示
+        for msg in messages:
+            sender = msg.get("sender", {})
+            sender_type = sender.get("sender_type", "")
+            sender_id = sender.get("id", "未知")
+            create_time = msg.get("create_time", "")
+
+            # 时间戳转可读时间
+            time_str = ""
+            if create_time:
+                try:
+                    ts = int(create_time) / 1000  # 毫秒 -> 秒
+                    time_str = time.strftime("%m-%d %H:%M", time.localtime(ts))
+                except (ValueError, OSError):
+                    time_str = create_time
+
+            # 发送者显示
+            is_app = sender_type == "app"
+            if is_app:
+                sender_display = "🤖 应用"
+            else:
+                sender_display = f"👤 {sender_id[:12]}..."
+
+            # 消息内容
+            text = _parse_msg_content(msg)
+
+            html_parts.append(self._format_message_html(time_str, sender_display, text, is_app))
+
+        html_parts.append('</div>')
+        self.chat_display.setHtml("".join(html_parts))
+
+        # 滚动到底部
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.chat_display.setTextCursor(cursor)
+
+        self.status_label.setText(f"已加载 {len(messages)} 条消息 - {self._current_chat_name}")
+
+    # ─── 消息类型切换 ─────────────────────
+
+    def _on_msg_type_changed(self, index):
+        """消息类型切换"""
+        is_rich = index == 1
+        self.title_label.setVisible(is_rich)
+        self.title_input.setVisible(is_rich)
+
+        placeholders = {
+            0: "输入消息... (Ctrl+Enter 发送)",
+            1: "输入富文本消息内容...\n支持多行，每行自动成为一个段落",
+            2: "输入卡片消息 JSON...",
+        }
+        self.msg_input.setPlaceholderText(placeholders.get(index, ""))
+
+    # ─── 发送消息 ─────────────────────
+
+    def _auto_detect_id_type(self, receive_id: str) -> str | None:
         """根据 ID 前缀自动检测类型"""
         if receive_id.startswith("oc_"):
             return "chat_id"
@@ -242,7 +595,7 @@ class MessagesTab(QWidget):
             return "union_id"
         elif "@" in receive_id:
             return "email"
-        return None  # 无法自动检测
+        return None
 
     def _on_send(self):
         """发送消息"""
@@ -250,30 +603,25 @@ class MessagesTab(QWidget):
             QMessageBox.warning(self, "提示", "请先完成认证")
             return
 
-        receive_id = self.receive_id_input.text().strip()
-        if not receive_id:
-            QMessageBox.warning(self, "提示", "请输入接收者 ID")
+        if not self._current_chat_id:
+            QMessageBox.warning(self, "提示", "请先选择一个会话对象")
             return
 
-        content = self.msg_content.toPlainText().strip()
+        content = self.msg_input.toPlainText().strip()
         if not content:
-            QMessageBox.warning(self, "提示", "请输入消息内容")
             return
 
-        # 解析接收类型（优先自动检测，其次用下拉框选择）
-        type_index = self.receive_type_combo.currentIndex()
-        receive_id_type_map = {0: "open_id", 1: "chat_id", 2: "user_id", 3: "email"}
-        receive_id_type = receive_id_type_map.get(type_index, "open_id")
+        receive_id = self._current_chat_id
+        receive_id_type = getattr(self, '_current_id_type', 'chat_id')
 
-        # 自动检测 ID 类型，覆盖用户选择（避免误选）
+        # 自动检测 ID 类型
         auto_type = self._auto_detect_id_type(receive_id)
         if auto_type:
             receive_id_type = auto_type
 
-        # 解析消息类型
         msg_type_index = self.msg_type_combo.currentIndex()
 
-        self.status_label.setText(f"正在发送 (receive_id_type={receive_id_type})...")
+        self.status_label.setText(f"正在发送...")
         self.send_btn.setEnabled(False)
 
         if msg_type_index == 0:
@@ -282,7 +630,7 @@ class MessagesTab(QWidget):
                 self._messages_api.send_text_message, receive_id, content, receive_id_type
             )
         elif msg_type_index == 1:
-            # 富文本消息 - 自动将纯文本转为 post 格式
+            # 富文本消息
             title = self.title_input.text().strip()
             post_content = text_to_post(content, title)
             self._worker = ApiWorker(
@@ -290,7 +638,6 @@ class MessagesTab(QWidget):
             )
         elif msg_type_index == 2:
             # 卡片消息
-            import json
             try:
                 card_content = json.loads(content)
             except json.JSONDecodeError as e:
@@ -310,12 +657,32 @@ class MessagesTab(QWidget):
         """发送结果"""
         self.send_btn.setEnabled(True)
         msg_id = result.get("data", {}).get("message_id", "未知")
-        self.status_label.setText(f"✅ 发送成功！消息 ID: {msg_id}")
-        QMessageBox.information(self, "发送成功", f"消息已发送\n消息 ID: {msg_id}")
+
+        # 在聊天框中以 HTML 格式追加发送的消息
+        content = self.msg_input.toPlainText().strip()
+        now_str = time.strftime("%m-%d %H:%M", time.localtime())
+        msg_html = self._format_message_html(now_str, "🤖 我（应用）", content, is_app=True)
+        # 移动到末尾并插入 HTML
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.chat_display.setTextCursor(cursor)
+        self.chat_display.insertHtml(msg_html)
+
+        # 滚动到底部
+        cursor.movePosition(QTextCursor.End)
+        self.chat_display.setTextCursor(cursor)
+
+        # 清空输入框
+        self.msg_input.clear()
+
+        self.status_label.setText(f"✅ 发送成功 (ID: {msg_id[:16]}...)")
+
+    # ─── 错误处理 ─────────────────────
 
     def _on_api_error(self, error_msg):
         """API 调用出错"""
         self.send_btn.setEnabled(True)
         self.load_chats_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
         self.status_label.setText(f"❌ 错误: {error_msg}")
-        QMessageBox.critical(self, "发送失败", error_msg)
+        QMessageBox.critical(self, "操作失败", error_msg)

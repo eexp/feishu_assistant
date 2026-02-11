@@ -18,8 +18,9 @@ from PySide6.QtGui import QColor
 from api.auth import FeishuAuth
 
 
-# 权限检测项定义：(权限名称, 权限 scope, 测试方法, 测试路径, 测试参数)
+# 权限检测项定义：按模块分类，覆盖系统所有 API 请求
 PERMISSION_CHECKS = [
+    # ━━━ 通讯录模块（联系人 Tab）━━━
     {
         "name": "通讯录 - 读取部门",
         "scope": "contact:department.base:readonly",
@@ -27,14 +28,26 @@ PERMISSION_CHECKS = [
         "path": "/contact/v3/departments/0/children",
         "params": {"department_id_type": "department_id", "page_size": 1},
         "description": "读取部门列表（联系人 Tab 的部门树功能）",
+        "module": "contacts",
     },
     {
-        "name": "通讯录 - 读取用户",
+        "name": "通讯录 - 读取部门用户",
         "scope": "contact:user.base:readonly",
         "method": "GET",
         "path": "/contact/v3/users/find_by_department",
         "params": {"department_id_type": "department_id", "department_id": "0", "page_size": 1},
         "description": "读取部门下的用户列表",
+        "module": "contacts",
+    },
+    {
+        "name": "通讯录 - 查询用户信息",
+        "scope": "contact:user.base:readonly",
+        "method": "GET",
+        "path": "/contact/v3/users/placeholder_user_id",
+        "params": {"user_id_type": "open_id"},
+        "description": "获取单个用户详细信息（预期 404 即可）",
+        "accept_not_found": True,
+        "module": "contacts",
     },
     {
         "name": "通讯录 - 用户 ID 查询",
@@ -44,6 +57,75 @@ PERMISSION_CHECKS = [
         "params": {"user_id_type": "open_id"},
         "json": {"emails": [], "mobiles": []},
         "description": "通过邮箱/手机号查询用户 ID",
+        "module": "contacts",
+    },
+    {
+        "name": "通讯录 - 搜索用户",
+        "scope": "search:user",
+        "method": "POST",
+        "path": "/search/v1/user",
+        "params": {"page_size": 1},
+        "json": {"query": "test"},
+        "description": "搜索用户功能",
+        "module": "contacts",
+    },
+    # ━━━ 消息模块（消息 Tab）━━━
+    {
+        "name": "消息 - 获取群列表",
+        "scope": "im:chat:readonly",
+        "method": "GET",
+        "path": "/im/v1/chats",
+        "params": {"page_size": 1},
+        "description": "获取机器人所在的群列表",
+        "module": "messages",
+    },
+    {
+        "name": "消息 - 获取群信息",
+        "scope": "im:chat",
+        "method": "GET",
+        "path": "/im/v1/chats/oc_permission_check_placeholder",
+        "params": {},
+        "description": "获取指定群聊详细信息（预期 404 即可）",
+        "accept_not_found": True,
+        "module": "messages",
+    },
+    {
+        "name": "消息 - 获取群成员",
+        "scope": "im:chat.member:readonly",
+        "method": "GET",
+        "path": "/im/v1/chats/oc_permission_check_placeholder/members",
+        "params": {"page_size": 1},
+        "description": "获取群聊成员列表（预期 404 即可）",
+        "accept_not_found": True,
+        "module": "messages",
+    },
+    {
+        "name": "消息 - 获取群历史消息",
+        "scope": "im:message.group_msg",
+        "method": "GET",
+        "path": "/im/v1/messages",
+        "params": {
+            "container_id_type": "chat",
+            "container_id": "oc_permission_check_placeholder",
+            "page_size": 1,
+        },
+        "description": "获取群组历史消息（读取历史消息功能的核心权限）",
+        "accept_not_found": True,
+        "module": "messages",
+    },
+    {
+        "name": "消息 - 获取单聊历史消息",
+        "scope": "im:message.p2p_msg",
+        "method": "GET",
+        "path": "/im/v1/messages",
+        "params": {
+            "container_id_type": "chat",
+            "container_id": "oc_permission_check_placeholder",
+            "page_size": 1,
+        },
+        "description": "获取单聊历史消息（p2p 场景需要此权限）",
+        "accept_not_found": True,
+        "module": "messages",
     },
     {
         "name": "消息 - 发送消息",
@@ -51,41 +133,69 @@ PERMISSION_CHECKS = [
         "method": "GET",
         "path": "/im/v1/chats",
         "params": {"page_size": 1},
-        "description": "机器人发送消息（通过获取群列表验证）",
+        "description": "机器人发送消息（通过获取群列表间接验证）",
+        "module": "messages",
     },
-    {
-        "name": "消息 - 读取群信息",
-        "scope": "im:chat:readonly",
-        "method": "GET",
-        "path": "/im/v1/chats",
-        "params": {"page_size": 1},
-        "description": "获取机器人所在的群列表",
-    },
+    # ━━━ 云文档模块（文档 Tab）━━━
     {
         "name": "云文档 - 读取文件列表",
         "scope": "drive:drive:readonly",
         "method": "GET",
         "path": "/drive/v1/files",
         "params": {"page_size": 1},
-        "description": "列出云文档文件（文档 Tab 功能）",
+        "description": "列出云文档文件列表",
+        "module": "documents",
+    },
+    {
+        "name": "云文档 - 读取文档元信息",
+        "scope": "docx:document:readonly",
+        "method": "GET",
+        "path": "/docx/v1/documents/placeholder_doc_id",
+        "params": {},
+        "description": "读取文档元信息（预期 404 即可）",
+        "accept_not_found": True,
+        "module": "documents",
     },
     {
         "name": "云文档 - 读取文档内容",
         "scope": "docx:document:readonly",
         "method": "GET",
-        "path": "/docx/v1/documents/placeholder",
-        "params": {},
-        "description": "读取文档内容（预期 404 即可，非权限错误就算通过）",
+        "path": "/docx/v1/documents/placeholder_doc_id/blocks",
+        "params": {"page_size": 1},
+        "description": "读取文档 Block 内容（预期 404 即可）",
         "accept_not_found": True,
+        "module": "documents",
     },
     {
-        "name": "搜索 - 搜索用户",
-        "scope": "search:user",
+        "name": "云文档 - 读取文档纯文本",
+        "scope": "docx:document:readonly",
+        "method": "GET",
+        "path": "/docx/v1/documents/placeholder_doc_id/raw_content",
+        "params": {},
+        "description": "读取文档纯文本内容（预期 404 即可）",
+        "accept_not_found": True,
+        "module": "documents",
+    },
+    {
+        "name": "云文档 - 搜索文档",
+        "scope": "docs:doc",
         "method": "POST",
-        "path": "/search/v1/user",
-        "params": {"page_size": 1},
-        "json": {"query": "test"},
-        "description": "搜索用户功能",
+        "path": "/suite/docs-api/search/object",
+        "json": {"search_key": "test", "count": 1, "offset": 0},
+        "params": {},
+        "description": "搜索云文档",
+        "module": "documents",
+    },
+    {
+        "name": "云文档 - 获取文件元数据",
+        "scope": "drive:drive:readonly",
+        "method": "POST",
+        "path": "/drive/v1/metas/batch_query",
+        "json": {"request_docs": [{"doc_token": "placeholder", "doc_type": "docx"}]},
+        "params": {},
+        "description": "批量获取文件元数据",
+        "accept_not_found": True,
+        "module": "documents",
     },
 ]
 
@@ -118,12 +228,29 @@ class PermissionCheckWorker(QThread):
                 passed += 1
             except Exception as e:
                 error_msg = str(e)
-                # 某些接口预期会返回 404（如文档内容用了 placeholder ID）
-                # 如果错误不是权限错误，则认为权限本身是通过的
-                if check.get("accept_not_found") and ("not found" in error_msg.lower() or "1120003" in error_msg):
+                # 权限相关的飞书错误码
+                perm_error_codes = [
+                    "99991400",   # 无权限
+                    "99991672",   # 无权限
+                    "99991671",   # scope 不足
+                    "99991663",   # 权限不足
+                ]
+                # 资源不存在相关错误码/关键词
+                not_found_keywords = [
+                    "not found", "not_found", "1120003",
+                    "230001", "1244002", "1244001",
+                    "invalid", "not exist",
+                ]
+
+                is_perm_error = any(code in error_msg for code in perm_error_codes) or \
+                                "permission" in error_msg.lower() or "forbidden" in error_msg.lower()
+                is_not_found = any(kw in error_msg.lower() if kw.isalpha() else kw in error_msg
+                                   for kw in not_found_keywords)
+
+                if check.get("accept_not_found") and is_not_found and not is_perm_error:
                     self.progress.emit(i, name, "passed", "权限正常（资源不存在但有权限）")
                     passed += 1
-                elif "99991400" in error_msg or "permission" in error_msg.lower() or "99991672" in error_msg:
+                elif is_perm_error:
                     self.progress.emit(i, name, "failed", f"无权限: {error_msg}")
                 else:
                     # 其他错误（如参数错误），不一定是权限问题
@@ -169,25 +296,35 @@ class PermissionsTab(QWidget):
 
         # --- 检测结果表格 ---
         self.result_table = QTableWidget()
-        self.result_table.setColumnCount(4)
-        self.result_table.setHorizontalHeaderLabels(["权限名称", "Scope", "状态", "详细信息"])
+        self.result_table.setColumnCount(5)
+        self.result_table.setHorizontalHeaderLabels(["模块", "权限名称", "Scope", "状态", "详细信息"])
         self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.result_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.result_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.result_table.setAlternatingRowColors(True)
         self.result_table.verticalHeader().setVisible(False)
         self.result_table.cellDoubleClicked.connect(self._on_detail_clicked)
 
+        # 模块显示名映射
+        module_labels = {
+            "contacts": "📒 通讯录",
+            "messages": "💬 消息",
+            "documents": "📄 云文档",
+        }
+
         # 预填充表格
         self.result_table.setRowCount(len(PERMISSION_CHECKS))
         for i, check in enumerate(PERMISSION_CHECKS):
-            self.result_table.setItem(i, 0, QTableWidgetItem(check["name"]))
-            self.result_table.setItem(i, 1, QTableWidgetItem(check["scope"]))
-            self.result_table.setItem(i, 2, QTableWidgetItem("⏳ 待检测"))
-            self.result_table.setItem(i, 3, QTableWidgetItem(check["description"]))
+            module_name = module_labels.get(check.get("module", ""), check.get("module", ""))
+            self.result_table.setItem(i, 0, QTableWidgetItem(module_name))
+            self.result_table.setItem(i, 1, QTableWidgetItem(check["name"]))
+            self.result_table.setItem(i, 2, QTableWidgetItem(check["scope"]))
+            self.result_table.setItem(i, 3, QTableWidgetItem("⏳ 待检测"))
+            self.result_table.setItem(i, 4, QTableWidgetItem(check["description"]))
 
         layout.addWidget(self.result_table)
 
@@ -217,9 +354,9 @@ class PermissionsTab(QWidget):
 
         # 重置表格状态
         for i in range(self.result_table.rowCount()):
-            self.result_table.setItem(i, 2, QTableWidgetItem("⏳ 检测中..."))
-            self.result_table.setItem(i, 3, QTableWidgetItem(""))
-            for col in range(4):
+            self.result_table.setItem(i, 3, QTableWidgetItem("⏳ 检测中..."))
+            self.result_table.setItem(i, 4, QTableWidgetItem(""))
+            for col in range(5):
                 item = self.result_table.item(i, col)
                 if item:
                     item.setBackground(QColor(255, 255, 255))
@@ -243,16 +380,16 @@ class PermissionsTab(QWidget):
             status_text = "⚠️ 异常"
             bg_color = QColor(255, 245, 200)  # 黄色
 
-        self.result_table.setItem(index, 2, QTableWidgetItem(status_text))
+        self.result_table.setItem(index, 3, QTableWidgetItem(status_text))
 
         # 详细信息：对于有错误的项，显示"点击查看"链接样式
         detail_item = QTableWidgetItem(detail)
         if status in ("failed", "warning"):
             detail_item.setForeground(QColor(0, 102, 204))  # 蓝色文字，表示可点击
             detail_item.setToolTip("双击查看详细信息")
-        self.result_table.setItem(index, 3, detail_item)
+        self.result_table.setItem(index, 4, detail_item)
 
-        for col in range(4):
+        for col in range(5):
             item = self.result_table.item(index, col)
             if item:
                 item.setBackground(bg_color)
@@ -262,20 +399,20 @@ class PermissionsTab(QWidget):
 
     def _on_detail_clicked(self, row, col):
         """双击详细信息列时弹出完整报错"""
-        if col != 3:
+        if col != 4:
             return
-        item = self.result_table.item(row, 3)
+        item = self.result_table.item(row, 4)
         if not item:
             return
         detail = item.data(Qt.UserRole)
         if not detail:
             return
         # 只有失败或异常的行才弹出详情
-        status_item = self.result_table.item(row, 2)
+        status_item = self.result_table.item(row, 3)
         if status_item and status_item.text() in ("✅ 通过",):
             return
 
-        name_item = self.result_table.item(row, 0)
+        name_item = self.result_table.item(row, 1)
         name = name_item.text() if name_item else "未知"
         msg = QMessageBox(self)
         msg.setWindowTitle(f"详细信息 - {name}")
