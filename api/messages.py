@@ -115,3 +115,68 @@ class MessagesAPI:
             params["page_token"] = page_token
 
         return self.auth.request("GET", f"/im/v1/chats/{chat_id}/members", params=params)
+
+    def get_chat_messages(self, container_id: str, start_time: str = "", end_time: str = "",
+                          page_token: str = "", page_size: int = 50, sort_type: str = "ByCreateTimeDesc") -> dict:
+        """
+        获取会话（群聊或单聊）的历史消息
+
+        :param container_id: 会话 ID (chat_id)
+        :param start_time: 起始时间戳（秒级），可选
+        :param end_time: 结束时间戳（秒级），可选
+        :param page_token: 分页 token
+        :param page_size: 每页数量，最大50
+        :param sort_type: 排序方式 ByCreateTimeAsc / ByCreateTimeDesc
+        :return: API 响应数据
+        """
+        params = {
+            "container_id_type": "chat",
+            "container_id": container_id,
+            "page_size": page_size,
+            "sort_type": sort_type,
+        }
+        if start_time:
+            params["start_time"] = start_time
+        if end_time:
+            params["end_time"] = end_time
+        if page_token:
+            params["page_token"] = page_token
+
+        return self.auth.request("GET", "/im/v1/messages", params=params)
+
+    def get_all_chat_messages(self, container_id: str, start_time: str = "", end_time: str = "",
+                              max_count: int = 200) -> list[dict]:
+        """
+        获取会话的所有历史消息（自动分页，限制最大条数）
+
+        :param container_id: 会话 ID (chat_id)
+        :param start_time: 起始时间戳（秒级），可选
+        :param end_time: 结束时间戳（秒级），可选
+        :param max_count: 最大获取条数
+        :return: 消息列表
+        """
+        all_messages = []
+        page_token = ""
+
+        while len(all_messages) < max_count:
+            data = self.get_chat_messages(
+                container_id, start_time, end_time, page_token,
+                sort_type="ByCreateTimeAsc"
+            )
+            items = data.get("data", {}).get("items", [])
+            all_messages.extend(items)
+
+            if not data.get("data", {}).get("has_more", False):
+                break
+            page_token = data.get("data", {}).get("page_token", "")
+
+        return all_messages[:max_count]
+
+    def get_chat_info(self, chat_id: str) -> dict:
+        """
+        获取群信息
+
+        :param chat_id: 群 ID
+        :return: API 响应数据
+        """
+        return self.auth.request("GET", f"/im/v1/chats/{chat_id}")

@@ -10,11 +10,9 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QLabel,
     QGroupBox,
-    QFormLayout,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
-    QSplitter,
 )
 from PySide6.QtCore import Qt, QThread, Signal
 
@@ -37,6 +35,32 @@ class ApiWorker(QThread):
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
+
+
+def text_to_post(text: str, title: str = "") -> dict:
+    """
+    将纯文本转换为飞书富文本 post 格式。
+    每行文本作为一个段落，空行保留。
+
+    :param text: 纯文本内容
+    :param title: 富文本标题（可选）
+    :return: post 格式的字典
+    """
+    lines = text.split("\n")
+    content = []
+    for line in lines:
+        if line.strip():
+            content.append([{"tag": "text", "text": line}])
+        else:
+            # 空行作为空段落
+            content.append([{"tag": "text", "text": ""}])
+
+    return {
+        "zh_cn": {
+            "title": title,
+            "content": content,
+        }
+    }
 
 
 class MessagesTab(QWidget):
@@ -66,6 +90,14 @@ class MessagesTab(QWidget):
         self.receive_type_combo.addItems(["open_id (用户)", "chat_id (群)", "user_id (用户ID)", "email (邮箱)"])
         self.receive_type_combo.currentIndexChanged.connect(self._on_type_changed)
         type_layout.addWidget(self.receive_type_combo)
+
+        # 加载群列表按钮（紧贴在接收类型右边，仅群模式可见）
+        self.load_chats_btn = QPushButton("📋 加载群列表")
+        self.load_chats_btn.clicked.connect(self._load_chats)
+        self.load_chats_btn.setVisible(False)
+        type_layout.addWidget(self.load_chats_btn)
+
+        type_layout.addStretch()
         target_layout.addLayout(type_layout)
 
         # ID 输入
@@ -75,13 +107,6 @@ class MessagesTab(QWidget):
         self.receive_id_input.setPlaceholderText("输入接收者的 open_id / chat_id / user_id / email")
         id_layout.addWidget(self.receive_id_input)
         target_layout.addLayout(id_layout)
-
-        # 群列表加载
-        chat_layout = QHBoxLayout()
-        self.load_chats_btn = QPushButton("加载群列表")
-        self.load_chats_btn.clicked.connect(self._load_chats)
-        chat_layout.addWidget(self.load_chats_btn)
-        target_layout.addLayout(chat_layout)
 
         self.chat_list = QListWidget()
         self.chat_list.setMaximumHeight(150)
@@ -99,13 +124,30 @@ class MessagesTab(QWidget):
         msg_type_layout = QHBoxLayout()
         msg_type_layout.addWidget(QLabel("消息类型:"))
         self.msg_type_combo = QComboBox()
-        self.msg_type_combo.addItems(["文本消息", "富文本消息 (JSON)", "卡片消息 (JSON)"])
+        self.msg_type_combo.addItems(["文本消息", "富文本消息", "卡片消息 (JSON)"])
+        self.msg_type_combo.currentIndexChanged.connect(self._on_msg_type_changed)
         msg_type_layout.addWidget(self.msg_type_combo)
         msg_layout.addLayout(msg_type_layout)
 
+        # 富文本标题（仅富文本模式显示）
+        self.title_layout = QHBoxLayout()
+        self.title_label = QLabel("标题:")
+        self.title_input = QLineEdit()
+        self.title_input.setPlaceholderText("富文本消息标题（可选）")
+        self.title_layout.addWidget(self.title_label)
+        self.title_layout.addWidget(self.title_input)
+        self.title_label.setVisible(False)
+        self.title_input.setVisible(False)
+        msg_layout.addLayout(self.title_layout)
+
         # 消息内容
         self.msg_content = QTextEdit()
-        self.msg_content.setPlaceholderText("输入消息内容...\n\n文本消息直接输入文字即可。\n富文本和卡片消息请输入 JSON 格式。")
+        self.msg_content.setPlaceholderText(
+            "输入消息内容...\n\n"
+            "• 文本消息：直接输入文字\n"
+            "• 富文本消息：直接输入文字，支持多行，每行自动成为一个段落\n"
+            "• 卡片消息：输入 JSON 格式的卡片内容"
+        )
         self.msg_content.setMinimumHeight(200)
         msg_layout.addWidget(self.msg_content)
 
@@ -125,10 +167,23 @@ class MessagesTab(QWidget):
         self.status_label = QLabel("就绪 - 填写接收者和消息内容后发送")
         layout.addWidget(self.status_label)
 
+    def _on_msg_type_changed(self, index):
+        """消息类型切换"""
+        is_rich = index == 1  # 富文本
+        self.title_label.setVisible(is_rich)
+        self.title_input.setVisible(is_rich)
+
+        placeholders = {
+            0: "输入消息内容...\n\n直接输入文字即可。",
+            1: "输入富文本消息内容...\n\n直接输入文字，支持多行。\n每行自动成为一个段落。",
+            2: "输入卡片消息 JSON...\n\n请输入完整的卡片 JSON 格式内容。",
+        }
+        self.msg_content.setPlaceholderText(placeholders.get(index, ""))
+
     def _on_type_changed(self, index):
         """接收类型切换"""
         is_chat = index == 1  # chat_id
-        self.chat_list.setVisible(is_chat)
+        self.chat_list.setVisible(is_chat and self.chat_list.count() > 0)
         self.load_chats_btn.setVisible(is_chat)
 
         type_map = {
@@ -218,7 +273,7 @@ class MessagesTab(QWidget):
         # 解析消息类型
         msg_type_index = self.msg_type_combo.currentIndex()
 
-        self.status_label.setText("正在发送...")
+        self.status_label.setText(f"正在发送 (receive_id_type={receive_id_type})...")
         self.send_btn.setEnabled(False)
 
         if msg_type_index == 0:
@@ -227,15 +282,9 @@ class MessagesTab(QWidget):
                 self._messages_api.send_text_message, receive_id, content, receive_id_type
             )
         elif msg_type_index == 1:
-            # 富文本消息
-            import json
-            try:
-                post_content = json.loads(content)
-            except json.JSONDecodeError as e:
-                QMessageBox.warning(self, "JSON 格式错误", f"富文本内容 JSON 解析失败:\n{e}")
-                self.send_btn.setEnabled(True)
-                self.status_label.setText("就绪")
-                return
+            # 富文本消息 - 自动将纯文本转为 post 格式
+            title = self.title_input.text().strip()
+            post_content = text_to_post(content, title)
             self._worker = ApiWorker(
                 self._messages_api.send_rich_text_message, receive_id, post_content, receive_id_type
             )

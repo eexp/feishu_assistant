@@ -32,11 +32,21 @@ def main():
             padding: 0 6px;
         }
         QPushButton {
-            padding: 5px 12px;
+            padding: 4px 10px;
+            border: 1px solid #c8c8c8;
             border-radius: 4px;
+            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #fafafa, stop:1 #f0f0f0);
         }
         QPushButton:hover {
+            border-color: #aaa;
+            background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f0f0f0, stop:1 #e6e6e6);
+        }
+        QPushButton:pressed {
             background-color: #e0e0e0;
+        }
+        QPushButton:disabled {
+            color: #aaa;
+            border-color: #ddd;
         }
         QTabWidget::pane {
             border: 1px solid #ccc;

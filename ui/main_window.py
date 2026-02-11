@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QStatusBar,
 )
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QThread, Signal, QSize
+from PySide6.QtGui import QFont, QIcon
 
 from api.auth import FeishuAuth
 from api.contacts import ContactsAPI
@@ -24,7 +24,61 @@ from api.documents import DocumentsAPI
 from ui.contacts_tab import ContactsTab
 from ui.messages_tab import MessagesTab
 from ui.documents_tab import DocumentsTab
+from ui.permissions_tab import PermissionsTab
 from utils.config_manager import get_credentials, save_credentials
+
+
+class PasswordLineEdit(QLineEdit):
+    """带内嵌显示/隐藏按钮的密码输入框，模仿网页密码框风格"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setEchoMode(QLineEdit.Password)
+        self._visible = False
+
+        self._toggle_btn = QPushButton("显示", self)
+        self._toggle_btn.setFixedSize(36, 20)
+        self._toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._toggle_btn.setToolTip("显示/隐藏密钥")
+        self._toggle_btn.setStyleSheet(
+            """
+            QPushButton {
+                border: 1px solid #ccc;
+                border-radius: 3px;
+                background: #f5f5f5;
+                color: #555;
+                font-size: 11px;
+                padding: 0 4px;
+            }
+            QPushButton:hover {
+                background: #e8e8e8;
+                color: #333;
+                border-color: #999;
+            }
+            QPushButton:pressed {
+                background: #ddd;
+            }
+            """
+        )
+        self._toggle_btn.clicked.connect(self._toggle_visibility)
+        # 右侧留出按钮空间
+        self.setTextMargins(0, 0, 42, 0)
+
+    def _toggle_visibility(self):
+        self._visible = not self._visible
+        if self._visible:
+            self.setEchoMode(QLineEdit.Normal)
+            self._toggle_btn.setText("隐藏")
+        else:
+            self.setEchoMode(QLineEdit.Password)
+            self._toggle_btn.setText("显示")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 将按钮定位到输入框右侧内部，垂直居中
+        btn_x = self.width() - self._toggle_btn.width() - 4
+        btn_y = (self.height() - self._toggle_btn.height()) // 2
+        self._toggle_btn.move(btn_x, btn_y)
 
 
 class AuthWorker(QThread):
@@ -76,20 +130,12 @@ class MainWindow(QMainWindow):
         self.app_id_input.setMinimumWidth(200)
         auth_layout.addWidget(self.app_id_input)
 
-        # App Secret
+        # App Secret（带内嵌显示/隐藏按钮）
         auth_layout.addWidget(QLabel("App Secret:"))
-        self.app_secret_input = QLineEdit()
+        self.app_secret_input = PasswordLineEdit()
         self.app_secret_input.setPlaceholderText("输入飞书应用的 App Secret")
-        self.app_secret_input.setEchoMode(QLineEdit.Password)
         self.app_secret_input.setMinimumWidth(200)
         auth_layout.addWidget(self.app_secret_input)
-
-        # 显示/隐藏密钥按钮
-        self.toggle_secret_btn = QPushButton("👁")
-        self.toggle_secret_btn.setFixedWidth(30)
-        self.toggle_secret_btn.setCheckable(True)
-        self.toggle_secret_btn.toggled.connect(self._toggle_secret_visibility)
-        auth_layout.addWidget(self.toggle_secret_btn)
 
         # 认证按钮
         self.auth_btn = QPushButton("🔗 认证")
@@ -116,10 +162,13 @@ class MainWindow(QMainWindow):
         self.contacts_tab = ContactsTab()
         self.messages_tab = MessagesTab()
         self.documents_tab = DocumentsTab()
+        self.permissions_tab = PermissionsTab()
 
+        self.tabs.addTab(self.permissions_tab, "🔐 权限检测")
         self.tabs.addTab(self.contacts_tab, "👥 联系人")
         self.tabs.addTab(self.messages_tab, "💬 消息")
         self.tabs.addTab(self.documents_tab, "📄 文档")
+        
 
         # 初始禁用 Tab
         self.tabs.setEnabled(False)
@@ -128,15 +177,6 @@ class MainWindow(QMainWindow):
 
         # --- 状态栏 ---
         self.statusBar().showMessage("请输入 App ID 和 App Secret 后点击认证")
-
-    def _toggle_secret_visibility(self, checked):
-        """切换密钥可见性"""
-        if checked:
-            self.app_secret_input.setEchoMode(QLineEdit.Normal)
-            self.toggle_secret_btn.setText("🙈")
-        else:
-            self.app_secret_input.setEchoMode(QLineEdit.Password)
-            self.toggle_secret_btn.setText("👁")
 
     def _load_saved_credentials(self):
         """加载已保存的凭证"""
@@ -193,6 +233,7 @@ class MainWindow(QMainWindow):
         self.contacts_tab.set_api(contacts_api)
         self.messages_tab.set_api(messages_api)
         self.documents_tab.set_api(documents_api)
+        self.permissions_tab.set_auth(self._auth)
 
     def _on_auth_error(self, error_msg):
         """认证失败"""
