@@ -83,7 +83,7 @@ PERMISSION_CHECKS = [
         "name": "消息 - 获取群信息",
         "scope": "im:chat",
         "method": "GET",
-        "path": "/im/v1/chats/oc_permission_check_placeholder",
+        "path": "/im/v1/chats/oc_000000000000000000000",
         "params": {},
         "description": "获取指定群聊详细信息（预期 404 即可）",
         "accept_not_found": True,
@@ -93,7 +93,7 @@ PERMISSION_CHECKS = [
         "name": "消息 - 获取群成员",
         "scope": "im:chat.member:readonly",
         "method": "GET",
-        "path": "/im/v1/chats/oc_permission_check_placeholder/members",
+        "path": "/im/v1/chats/oc_000000000000000000000/members",
         "params": {"page_size": 1},
         "description": "获取群聊成员列表（预期 404 即可）",
         "accept_not_found": True,
@@ -106,11 +106,13 @@ PERMISSION_CHECKS = [
         "path": "/im/v1/messages",
         "params": {
             "container_id_type": "chat",
-            "container_id": "oc_permission_check_placeholder",
+            "container_id": "__DYNAMIC_CHAT_ID__",
             "page_size": 1,
         },
         "description": "获取群组历史消息（读取历史消息功能的核心权限）",
         "accept_not_found": True,
+        "needs_real_chat_id": True,
+        "chat_type": "group",
         "module": "messages",
     },
     {
@@ -120,11 +122,13 @@ PERMISSION_CHECKS = [
         "path": "/im/v1/messages",
         "params": {
             "container_id_type": "chat",
-            "container_id": "oc_permission_check_placeholder",
+            "container_id": "__DYNAMIC_CHAT_ID__",
             "page_size": 1,
         },
         "description": "获取单聊历史消息（p2p 场景需要此权限）",
         "accept_not_found": True,
+        "needs_real_chat_id": True,
+        "chat_type": "p2p",
         "module": "messages",
     },
     {
@@ -147,32 +151,12 @@ PERMISSION_CHECKS = [
         "module": "documents",
     },
     {
-        "name": "云文档 - 读取文档元信息",
-        "scope": "docx:document:readonly",
-        "method": "GET",
-        "path": "/docx/v1/documents/placeholder_doc_id",
-        "params": {},
-        "description": "读取文档元信息（预期 404 即可）",
-        "accept_not_found": True,
-        "module": "documents",
-    },
-    {
         "name": "云文档 - 读取文档内容",
         "scope": "docx:document:readonly",
         "method": "GET",
         "path": "/docx/v1/documents/placeholder_doc_id/blocks",
         "params": {"page_size": 1},
         "description": "读取文档 Block 内容（预期 404 即可）",
-        "accept_not_found": True,
-        "module": "documents",
-    },
-    {
-        "name": "云文档 - 读取文档纯文本",
-        "scope": "docx:document:readonly",
-        "method": "GET",
-        "path": "/docx/v1/documents/placeholder_doc_id/raw_content",
-        "params": {},
-        "description": "读取文档纯文本内容（预期 404 即可）",
         "accept_not_found": True,
         "module": "documents",
     },
@@ -211,17 +195,67 @@ class PermissionCheckWorker(QThread):
         super().__init__()
         self.auth = auth
 
+    def _fetch_real_chat_ids(self) -> dict[str, str | None]:
+        """
+        从群列表 API 动态获取真实的 chat_id，按类型分类。
+        返回 {"group": chat_id_or_None, "p2p": chat_id_or_None}
+        """
+        result = {"group": None, "p2p": None}
+        try:
+            data = self.auth.request("GET", "/im/v1/chats", params={"page_size": 50})
+            items = data.get("data", {}).get("items", [])
+            for item in items:
+                chat_type = item.get("chat_type", "")  # "group" 或 "p2p"
+                chat_id = item.get("chat_id", "")
+                if chat_type == "group" and not result["group"] and chat_id:
+                    result["group"] = chat_id
+                elif chat_type == "p2p" and not result["p2p"] and chat_id:
+                    result["p2p"] = chat_id
+                if result["group"] and result["p2p"]:
+                    break
+        except Exception:
+            pass
+        return result
+
     def run(self):
         passed = 0
         warning = 0
         total = len(PERMISSION_CHECKS)
 
+        # 预先获取真实的 chat_id，用于历史消息权限检测
+        real_chat_ids = self._fetch_real_chat_ids()
+
         for i, check in enumerate(PERMISSION_CHECKS):
             name = check["name"]
+
+            # 需要真实 chat_id 的检测项：动态替换占位符
+            if check.get("needs_real_chat_id"):
+                chat_type = check.get("chat_type", "group")
+                real_id = real_chat_ids.get(chat_type)
+                if not real_id:
+                    # 没有对应类型的会话，无法检测，标记为 warning
+                    type_label = "群聊" if chat_type == "group" else "单聊"
+                    self.progress.emit(
+                        i, name, "warning",
+                        f"跳过检测：机器人未加入任何{type_label}，无法验证此权限。"
+                        f"请将机器人添加到至少一个{type_label}后重新检测。"
+                    )
+                    warning += 1
+                    continue
+
             try:
-                kwargs = {"params": check.get("params", {})}
+                # 深拷贝 params，避免修改原始定义
+                params = dict(check.get("params", {}))
+                kwargs = {"params": params}
                 if "json" in check:
                     kwargs["json"] = check["json"]
+
+                # 替换动态 chat_id 占位符
+                if check.get("needs_real_chat_id"):
+                    chat_type = check.get("chat_type", "group")
+                    real_id = real_chat_ids.get(chat_type)
+                    if "__DYNAMIC_CHAT_ID__" in params.get("container_id", ""):
+                        params["container_id"] = real_id
 
                 self.auth.request(check["method"], check["path"], **kwargs)
                 self.progress.emit(i, name, "passed", "权限正常")
@@ -234,6 +268,7 @@ class PermissionCheckWorker(QThread):
                     "99991672",   # 无权限
                     "99991671",   # scope 不足
                     "99991663",   # 权限不足
+                    "230027",     # Lack of necessary permissions
                 ]
                 # 资源不存在相关错误码/关键词
                 not_found_keywords = [
@@ -242,8 +277,11 @@ class PermissionCheckWorker(QThread):
                     "invalid", "not exist",
                 ]
 
+                # 权限错误检测：使用更精确的匹配避免误判
                 is_perm_error = any(code in error_msg for code in perm_error_codes) or \
-                                "permission" in error_msg.lower() or "forbidden" in error_msg.lower()
+                                "no permission" in error_msg.lower() or \
+                                "lack of necessary permissions" in error_msg.lower() or \
+                                "forbidden" in error_msg.lower()
                 is_not_found = any(kw in error_msg.lower() if kw.isalpha() else kw in error_msg
                                    for kw in not_found_keywords)
 

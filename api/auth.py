@@ -72,6 +72,15 @@ class FeishuAuth:
 
         return data
 
+    def get_bot_info(self) -> dict:
+        """
+        获取机器人信息，包括应用名称、头像等。
+        
+        :return: 机器人信息字典，包含 app_name, avatar_url, open_id 等
+        """
+        data = self.request("GET", "/bot/v3/info")
+        return data.get("bot", {})
+
     def verify(self) -> bool:
         """验证凭证是否有效，成功返回 True"""
         try:

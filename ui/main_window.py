@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
     QStatusBar,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtGui import QFont, QIcon, QPixmap
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 
 from api.auth import FeishuAuth
 from api.contacts import ContactsAPI
@@ -82,9 +83,9 @@ class PasswordLineEdit(QLineEdit):
 
 
 class AuthWorker(QThread):
-    """认证异步线程"""
+    """认证异步线程，获取 token 并拉取机器人信息"""
 
-    success = Signal()
+    success = Signal(dict)  # bot_info dict
     error = Signal(str)
 
     def __init__(self, auth: FeishuAuth):
@@ -94,7 +95,12 @@ class AuthWorker(QThread):
     def run(self):
         try:
             self.auth.get_tenant_access_token()
-            self.success.emit()
+            # 认证成功后获取机器人信息
+            try:
+                bot_info = self.auth.get_bot_info()
+            except Exception:
+                bot_info = {}
+            self.success.emit(bot_info)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -121,40 +127,71 @@ class MainWindow(QMainWindow):
 
         # --- 认证区域 ---
         auth_group = QGroupBox("🔐 飞书应用凭证")
-        auth_layout = QHBoxLayout(auth_group)
+        auth_group_layout = QVBoxLayout(auth_group)
+
+        # 凭证输入行
+        auth_input_layout = QHBoxLayout()
 
         # App ID
-        auth_layout.addWidget(QLabel("App ID:"))
+        auth_input_layout.addWidget(QLabel("App ID:"))
         self.app_id_input = QLineEdit()
         self.app_id_input.setPlaceholderText("输入飞书应用的 App ID")
         self.app_id_input.setMinimumWidth(200)
-        auth_layout.addWidget(self.app_id_input)
+        auth_input_layout.addWidget(self.app_id_input)
 
         # App Secret（带内嵌显示/隐藏按钮）
-        auth_layout.addWidget(QLabel("App Secret:"))
+        auth_input_layout.addWidget(QLabel("App Secret:"))
         self.app_secret_input = PasswordLineEdit()
         self.app_secret_input.setPlaceholderText("输入飞书应用的 App Secret")
         self.app_secret_input.setMinimumWidth(200)
-        auth_layout.addWidget(self.app_secret_input)
+        auth_input_layout.addWidget(self.app_secret_input)
 
         # 认证按钮
         self.auth_btn = QPushButton("🔗 认证")
         self.auth_btn.setMinimumWidth(80)
         self.auth_btn.clicked.connect(self._on_authenticate)
-        auth_layout.addWidget(self.auth_btn)
+        auth_input_layout.addWidget(self.auth_btn)
 
         # 保存按钮
         self.save_btn = QPushButton("💾 保存")
         self.save_btn.setToolTip("保存凭证到本地")
         self.save_btn.clicked.connect(self._save_credentials)
-        auth_layout.addWidget(self.save_btn)
+        auth_input_layout.addWidget(self.save_btn)
 
         # 认证状态
         self.auth_status = QLabel("❌ 未认证")
         self.auth_status.setMinimumWidth(100)
-        auth_layout.addWidget(self.auth_status)
+        auth_input_layout.addWidget(self.auth_status)
+
+        auth_group_layout.addLayout(auth_input_layout)
+
+        # 机器人信息行（认证成功后显示）
+        self.bot_info_widget = QWidget()
+        bot_info_layout = QHBoxLayout(self.bot_info_widget)
+        bot_info_layout.setContentsMargins(0, 4, 0, 0)
+
+        self.bot_avatar_label = QLabel()
+        self.bot_avatar_label.setFixedSize(32, 32)
+        self.bot_avatar_label.setScaledContents(True)
+        self.bot_avatar_label.setStyleSheet("border-radius: 4px;")
+        bot_info_layout.addWidget(self.bot_avatar_label)
+
+        self.bot_name_label = QLabel()
+        self.bot_name_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        bot_info_layout.addWidget(self.bot_name_label)
+
+        self.bot_detail_label = QLabel()
+        self.bot_detail_label.setStyleSheet("color: #666; font-size: 12px;")
+        bot_info_layout.addWidget(self.bot_detail_label)
+
+        bot_info_layout.addStretch()
+        self.bot_info_widget.setVisible(False)
+        auth_group_layout.addWidget(self.bot_info_widget)
 
         main_layout.addWidget(auth_group)
+
+        # 用于异步加载头像的网络管理器
+        self._net_manager = QNetworkAccessManager(self)
 
         # --- Tab 容器 ---
         self.tabs = QTabWidget()
@@ -217,11 +254,27 @@ class MainWindow(QMainWindow):
         self._auth_worker.error.connect(self._on_auth_error)
         self._auth_worker.start()
 
-    def _on_auth_success(self):
-        """认证成功"""
+    def _on_auth_success(self, bot_info: dict):
+        """认证成功，显示机器人信息"""
         self.auth_btn.setEnabled(True)
         self.auth_status.setText("✅ 已认证")
         self.statusBar().showMessage("✅ 认证成功！可以开始使用各功能了")
+
+        # 显示机器人信息
+        if bot_info:
+            app_name = bot_info.get("app_name", "未知应用")
+            open_id = bot_info.get("open_id", "")
+            avatar_url = bot_info.get("avatar_url", "")
+
+            self.bot_name_label.setText(f"🤖 {app_name}")
+            self.bot_detail_label.setText(f"Open ID: {open_id}")
+            self.bot_info_widget.setVisible(True)
+
+            # 异步加载头像
+            if avatar_url:
+                self._load_bot_avatar(avatar_url)
+        else:
+            self.bot_info_widget.setVisible(False)
 
         # 启用 Tab 并传入 API
         self.tabs.setEnabled(True)
@@ -234,6 +287,25 @@ class MainWindow(QMainWindow):
         self.messages_tab.set_api(messages_api)
         self.documents_tab.set_api(documents_api)
         self.permissions_tab.set_auth(self._auth)
+
+    def _load_bot_avatar(self, url: str):
+        """异步加载机器人头像"""
+        from PySide6.QtCore import QUrl
+        request = QNetworkRequest(QUrl(url))
+        reply = self._net_manager.get(request)
+        reply.finished.connect(lambda: self._on_avatar_loaded(reply))
+
+    def _on_avatar_loaded(self, reply: QNetworkReply):
+        """头像下载完成"""
+        if reply.error() == QNetworkReply.NoError:
+            data = reply.readAll()
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            if not pixmap.isNull():
+                self.bot_avatar_label.setPixmap(
+                    pixmap.scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+        reply.deleteLater()
 
     def _on_auth_error(self, error_msg):
         """认证失败"""
