@@ -96,7 +96,7 @@ jobs:
       - name: Build with PyInstaller (Windows)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --noconfirm --onedir --windowed `
+          pyinstaller --noconfirm --onefile --windowed `
             --name "FeishuAssistant" `
             --icon "icon.ico" `
             --add-data "api;api" `
@@ -143,7 +143,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "dist/FeishuAssistant/*" -DestinationPath "${{ matrix.artifact_name }}.zip"
+          Copy-Item "dist/FeishuAssistant.exe" "${{ matrix.artifact_name }}.exe"
 
       - name: Package artifact (macOS)
         if: runner.os == 'macOS'
@@ -154,11 +154,30 @@ jobs:
           if [ -f icon.icns ]; then
             cp icon.icns dist/FeishuAssistant.app/Contents/Resources/icon-windowed.icns 2>/dev/null || true
           fi
-          # Create DMG for easy distribution (double-click to install)
-          hdiutil create -volname "FeishuAssistant" \
-            -srcfolder "dist/FeishuAssistant.app" \
-            -ov -format UDZO \
-            "${{ matrix.artifact_name }}.dmg"
+          # Install create-dmg for beautiful drag-to-install DMG
+          brew install create-dmg
+          # Create DMG with Applications symlink for drag-to-install
+          # create-dmg returns exit code 2 when DMG is created but Finder props fail (cosmetic only)
+          set +e
+          create-dmg \
+            --volname "飞书助手" \
+            --volicon "icon.icns" \
+            --window-pos 200 120 \
+            --window-size 660 400 \
+            --icon-size 100 \
+            --icon "FeishuAssistant.app" 180 170 \
+            --hide-extension "FeishuAssistant.app" \
+            --app-drop-link 480 170 \
+            --no-internet-enable \
+            "${{ matrix.artifact_name }}.dmg" \
+            "dist/FeishuAssistant.app"
+          EXIT_CODE=$?
+          set -e
+          if [ $EXIT_CODE -ne 0 ] && [ $EXIT_CODE -ne 2 ]; then
+            echo "create-dmg failed with exit code $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
+          echo "DMG created successfully"
 
       - name: Package artifact (Linux)
         if: runner.os == 'Linux'
@@ -172,7 +191,7 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: |
-            ${{ matrix.artifact_name }}.zip
+            ${{ matrix.artifact_name }}.exe
             ${{ matrix.artifact_name }}.tar.gz
             ${{ matrix.artifact_name }}.dmg
           if-no-files-found: ignore
@@ -198,6 +217,6 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            artifacts/**/*.zip
+            artifacts/**/*.exe
             artifacts/**/*.tar.gz
             artifacts/**/*.dmg
