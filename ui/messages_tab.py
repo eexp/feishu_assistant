@@ -2,6 +2,7 @@
 
 import json
 import time
+from datetime import datetime, timezone, timedelta
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QFrame,
+    QDialog,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QUrl
 from PySide6.QtGui import QFont, QColor, QTextCursor, QIcon, QPixmap
@@ -134,9 +136,11 @@ class MessagesTab(QWidget):
         super().__init__(parent)
         self._messages_api = None
         self._worker = None
+        self._old_workers = []  # 保持旧 worker 引用，防止被 GC 提前销毁
         self._current_chat_id = None
         self._current_chat_name = ""
         self._chat_data_cache = {}  # chat_id -> chat info
+        self._p2p_contacts = {}  # owner_id(open_id) -> {chat_id, name} 去重的单聊联系人
         self._avatar_cache = {}  # chat_id -> QIcon
         self._net_manager = QNetworkAccessManager(self)
         self._setup_ui()
@@ -144,6 +148,21 @@ class MessagesTab(QWidget):
     def set_api(self, messages_api):
         """设置 API 实例"""
         self._messages_api = messages_api
+
+    def _start_new_worker(self, worker):
+        """
+        安全地启动新 worker，妥善处理旧 worker 的生命周期。
+        防止 QThread 在回调中被替换时过早销毁导致崩溃。
+        """
+        if self._worker is not None:
+            # 将旧 worker 移入保留列表，防止 GC
+            self._old_workers.append(self._worker)
+            # 安排旧 worker 延迟销毁
+            self._worker.deleteLater()
+        self._worker = worker
+        # 清理已完成的旧 workers
+        self._old_workers = [w for w in self._old_workers if w.isRunning()]
+        self._worker.start()
 
     def _setup_ui(self):
         main_layout = QHBoxLayout(self)
@@ -380,57 +399,61 @@ class MessagesTab(QWidget):
         self.left_status.setText("正在加载会话列表...")
         self.load_chats_btn.setEnabled(False)
 
-        self._worker = ApiWorker(self._messages_api.get_all_chats)
-        self._worker.finished.connect(self._on_chats_loaded)
-        self._worker.error.connect(self._on_api_error)
-        self._worker.start()
+        worker = ApiWorker(self._messages_api.get_all_chats)
+        worker.finished.connect(self._on_chats_loaded)
+        worker.error.connect(self._on_api_error)
+        self._start_new_worker(worker)
 
     def _on_chats_loaded(self, chats):
         """会话列表加载完成"""
         self.chat_list.clear()
         self._chat_data_cache.clear()
+        self._p2p_contacts.clear()
 
-        p2p_count = 0
         group_count = 0
+        all_owner_ids = {}  # owner_id -> 第一个出现的 chat 信息（用于去重）
 
+        # ── 第一轮：显示所有会话，同时收集所有 owner_id ──
         for chat in chats:
             name = chat.get("name", "未命名会话")
             chat_id = chat.get("chat_id", "")
-            # chat_mode / chat_type 可能在不同 API 版本中字段不同
             chat_mode = chat.get("chat_mode", "") or chat.get("chat_type", "")
             description = chat.get("description", "")
             owner_id = chat.get("owner_id", "")
             member_count = chat.get("user_count", "") or chat.get("member_count", "")
             avatar_url = chat.get("avatar", "")
 
-            # 图标和标签区分群聊和单聊
-            if chat_mode == "p2p":
-                p2p_count += 1
-                if not name or name == "未命名会话":
-                    name = f"用户 {owner_id[:12]}..." if owner_id else "未命名单聊"
-                display_text = f"👤 {name}"
-            else:
-                if not chat_mode:
-                    chat_mode = "group"  # 默认为群聊
-                group_count += 1
-                display_text = f"👥 {name}"
-                if member_count:
-                    display_text += f" ({member_count}人)"
+            # 收集所有会话的 owner_id（群聊 + 单聊）
+            if owner_id and owner_id not in all_owner_ids:
+                all_owner_ids[owner_id] = {
+                    "owner_id": owner_id,
+                    "first_chat_name": name,
+                    "first_chat_id": chat_id,
+                }
+
+            # 显示会话条目
+            if not chat_mode:
+                chat_mode = "group"
+            group_count += 1
+            display_text = f"👥 {name}"
+            if member_count:
+                display_text += f" ({member_count}人)"
 
             item = QListWidgetItem(display_text)
             item.setData(Qt.UserRole, chat_id)
             item.setData(Qt.UserRole + 1, name)
-            item.setData(Qt.UserRole + 2, chat_mode)  # 存储会话类型用于过滤
+            item.setData(Qt.UserRole + 2, "group")  # 会话类型
             item.setToolTip(
                 f"会话名: {name}\n"
-                f"ID: {chat_id}\n"
-                f"类型: {'单聊' if chat_mode == 'p2p' else '群聊'}\n"
+                f"chat_id: {chat_id}\n"
+                f"owner_id: {owner_id}\n"
+                f"类型: 群聊\n"
                 f"描述: {description}\n"
                 f"成员数: {member_count}"
             )
             self.chat_list.addItem(item)
 
-            # 缓存 chat_mode 到 chat 数据中（方便后续使用）
+            # 缓存
             chat["_resolved_chat_mode"] = chat_mode
             self._chat_data_cache[chat_id] = chat
 
@@ -438,8 +461,43 @@ class MessagesTab(QWidget):
             if avatar_url:
                 self._load_chat_avatar(avatar_url, chat_id)
 
+        # ── 第二轮：添加去重后的单聊联系人区域 ──
+        if all_owner_ids:
+            # 分隔线
+            separator = QListWidgetItem("──── 单聊联系人 ────")
+            separator.setFlags(Qt.NoItemFlags)  # 不可点击
+            separator.setForeground(QColor("#999"))
+            font = QFont()
+            font.setBold(True)
+            font.setPointSize(10)
+            separator.setFont(font)
+            self.chat_list.addItem(separator)
+
+            for oid, info in all_owner_ids.items():
+                display_text = f"👤 {oid}"
+                item = QListWidgetItem(display_text)
+                # 以 owner_id 作为数据，后面点击时走 open_id 发送模式
+                item.setData(Qt.UserRole, oid)
+                item.setData(Qt.UserRole + 1, oid)
+                item.setData(Qt.UserRole + 2, "p2p")  # 标记为单聊联系人
+                item.setToolTip(
+                    f"open_id: {oid}\n"
+                    f"来源会话: {info['first_chat_name']}\n"
+                    f"💡 点击自动获取单聊会话并加载历史消息"
+                )
+                self.chat_list.addItem(item)
+
+                # 缓存到 p2p 联系人
+                self._p2p_contacts[oid] = {
+                    "owner_id": oid,
+                    "name": oid,
+                    "chat_id": None,  # 尚无 p2p chat_id
+                }
+
+        unique_contacts = len(self._p2p_contacts)
         self.left_status.setText(
-            f"已加载 {len(chats)} 个会话 (群聊 {group_count}, 单聊 {p2p_count})"
+            f"已加载 {len(chats)} 个会话, "
+            f"单聊联系人 {unique_contacts} 个 (从 owner_id 去重)"
         )
         self.load_chats_btn.setEnabled(True)
 
@@ -473,6 +531,12 @@ class MessagesTab(QWidget):
 
         for i in range(self.chat_list.count()):
             item = self.chat_list.item(i)
+
+            # 分隔线：跟随单聊联系人的可见性
+            if item.flags() == Qt.NoItemFlags:
+                item.setHidden(type_filter == 1)  # 群聊模式下隐藏分隔线
+                continue
+
             chat_mode = item.data(Qt.UserRole + 2) or ""
             visible = True
 
@@ -482,7 +546,7 @@ class MessagesTab(QWidget):
 
             # 类型过滤
             if type_filter == 1 and chat_mode == "p2p":
-                visible = False  # 群聊模式下隐藏单聊
+                visible = False  # 群聊模式下隐藏单聊联系人
             elif type_filter == 2 and chat_mode != "p2p":
                 visible = False  # 单聊模式下隐藏群聊
 
@@ -490,9 +554,19 @@ class MessagesTab(QWidget):
 
     def _on_chat_selected(self, item):
         """选择一个会话"""
-        chat_id = item.data(Qt.UserRole)
+        if not item or item.flags() == Qt.NoItemFlags:
+            return  # 分隔线不可点击
+
+        item_id = item.data(Qt.UserRole)
         chat_name = item.data(Qt.UserRole + 1)
-        self._open_chat(chat_id, chat_name)
+        chat_type = item.data(Qt.UserRole + 2) or ""
+
+        if chat_type == "p2p":
+            # 单聊联系人：item_id 是 owner_id (open_id)
+            self._open_p2p_chat_for_user(item_id)
+        else:
+            # 群聊：item_id 是 chat_id
+            self._open_chat(item_id, chat_name)
 
     def _on_manual_open(self):
         """手动输入 ID 打开会话"""
@@ -511,10 +585,11 @@ class MessagesTab(QWidget):
             id_type = auto_type
 
         if id_type == "chat_id":
-            self._open_chat(raw_id, f"会话 {raw_id[:12]}...")
+            # chat_id 直接打开会话并加载历史
+            self._open_chat_with_info(raw_id)
         elif id_type == "open_id":
-            # open_id 类型：尝试从已加载的会话列表中查找对应的单聊
-            self._find_p2p_chat_for_user(raw_id)
+            # open_id 类型：先尝试发送消息获取 chat_id，再加载历史
+            self._open_p2p_chat_for_user(raw_id)
         else:
             # 其他类型（user_id / email）：仅支持发送，不加载历史
             self._current_chat_id = raw_id
@@ -525,96 +600,224 @@ class MessagesTab(QWidget):
             self.chat_display.setPlaceholderText(
                 f"已选择 {id_type} 类型的接收者: {raw_id}\n\n"
                 "提示：该类型无法直接加载历史消息，但可以发送消息。\n"
-                "如需查看历史消息，请使用 chat_id 或 open_id。"
+                "发送消息后系统将自动获取 chat_id 并加载历史记录。"
             )
             self.send_btn.setEnabled(True)
             self.refresh_btn.setEnabled(False)
             self.status_label.setText(f"已选择 {id_type}: {raw_id}")
 
-    def _find_p2p_chat_for_user(self, open_id: str):
+    def _open_chat_with_info(self, chat_id: str):
         """
-        根据用户 open_id 查找对应的单聊会话。
-        遍历所有已加载的会话，逐个检查成员是否匹配。
+        通过 chat_id 打开会话，先获取会话信息确定名称和类型。
         """
         if not self._messages_api:
             QMessageBox.warning(self, "提示", "请先完成认证")
             return
 
-        if not self._chat_data_cache:
-            # 还没加载过会话列表，提示用户
-            QMessageBox.information(
-                self, "提示",
-                "请先点击「加载会话列表」获取会话数据，\n然后再通过 open_id 查找单聊会话。"
-            )
-            return
-
-        # 获取所有会话 ID（优先搜索 p2p 类型，再搜索其他类型）
-        all_chat_ids = list(self._chat_data_cache.keys())
-        # 把 p2p 类型排前面优先搜索
-        all_chat_ids.sort(
-            key=lambda cid: 0 if self._chat_data_cache[cid].get("_resolved_chat_mode") == "p2p" else 1
-        )
-
-        self.status_label.setText("正在查找用户单聊会话...")
+        self.status_label.setText("正在获取会话信息...")
         self.manual_open_btn.setEnabled(False)
 
-        def search_chats():
-            """在后台线程中逐个检查会话的成员"""
-            for chat_id in all_chat_ids:
-                try:
-                    members = self._messages_api.get_all_chat_members(chat_id)
-                    for member in members:
-                        if member.get("member_id") == open_id:
-                            chat_info = self._chat_data_cache.get(chat_id, {})
-                            member_name = member.get("name", "")
-                            chat_name = chat_info.get("name", "") or member_name or "会话"
-                            return {
-                                "chat_id": chat_id,
-                                "name": chat_name,
-                                "member_name": member_name,
-                            }
-                except Exception:
-                    continue
-            return None
+        def fetch_info():
+            info = self._messages_api.get_chat_info(chat_id)
+            return info
 
-        self._worker = ApiWorker(search_chats)
-        self._worker.finished.connect(lambda result: self._on_p2p_found(result, open_id))
-        self._worker.error.connect(self._on_api_error)
-        self._worker.start()
+        worker = ApiWorker(fetch_info)
+        worker.finished.connect(lambda result: self._on_chat_info_loaded(result, chat_id))
+        worker.error.connect(lambda err: self._on_chat_info_error(err, chat_id))
+        self._start_new_worker(worker)
 
-    def _on_p2p_found(self, result, open_id: str):
-        """查找单聊会话结果回调"""
+    def _on_chat_info_loaded(self, result, chat_id: str):
+        """会话信息加载完成"""
         self.manual_open_btn.setEnabled(True)
+        data = result.get("data", {})
+        chat_mode = data.get("chat_mode", "")
+        name = data.get("name", "")
 
-        if result:
-            chat_id = result["chat_id"]
-            name = result.get("member_name") or result.get("name", "单聊")
-            display_name = f"👤 {name}"
-            self.status_label.setText(f"已找到用户 {name} 的单聊会话")
-            self._open_chat(chat_id, display_name)
+        if chat_mode == "p2p":
+            display_name = f"👤 {name}" if name else f"👤 单聊 {chat_id[:12]}..."
         else:
-            # 没找到匹配的 p2p 会话，降级为仅发送模式
-            self._set_open_id_send_only(open_id)
-            self.status_label.setText("未找到匹配的单聊会话，已切换为发送模式")
+            member_count = data.get("user_count", "")
+            display_name = f"👥 {name}" if name else f"👥 群聊 {chat_id[:12]}..."
+            if member_count:
+                display_name += f" ({member_count}人)"
 
-    def _set_open_id_send_only(self, open_id: str):
-        """将 open_id 设为仅发送模式（无法加载历史）"""
+        self._open_chat(chat_id, display_name)
+
+    def _on_chat_info_error(self, error_msg: str, chat_id: str):
+        """获取会话信息失败时，仍尝试打开"""
+        self.manual_open_btn.setEnabled(True)
+        self.status_label.setText(f"获取会话信息失败，尝试直接加载消息...")
+        self._open_chat(chat_id, f"会话 {chat_id[:12]}...")
+
+    def _open_p2p_chat_for_user(self, open_id: str):
+        """
+        通过 open_id 打开单聊会话。
+        策略：先从联系人缓存中查找已有的 p2p chat_id（O(1) 查找），
+        找不到则自动发送一条临时消息获取 chat_id，然后撤回该消息并加载历史。
+        """
+        if not self._messages_api:
+            QMessageBox.warning(self, "提示", "请先完成认证")
+            return
+
+        # 从联系人缓存中查找 (O(1))
+        contact = self._p2p_contacts.get(open_id)
+        if contact and contact.get("chat_id"):
+            # 已有 p2p chat_id，直接打开
+            chat_id = contact["chat_id"]
+            name = contact.get("name", "") or f"用户 {open_id[:12]}..."
+            self.status_label.setText(
+                f"✅ 已找到单聊会话 (chat_id: {chat_id[:16]}...)"
+            )
+            self._open_chat(chat_id, f"👤 {name}")
+            return
+
+        # 没有 p2p chat_id，自动发送临时消息获取 chat_id 并撤回
+        self._send_temp_and_load_history(open_id)
+
+    def _send_temp_and_load_history(self, open_id: str):
+        """
+        弹出对话框让用户选择发送方式，发送消息获取 chat_id，然后加载历史记录。
+        用户可以选择"发送消息"（保留消息）或"发送并撤回"（发送后立即撤回）。
+        """
+        # 弹出选择对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle("获取单聊会话")
+        dialog.setMinimumWidth(400)
+        dlg_layout = QVBoxLayout(dialog)
+
+        # 说明文字
+        info_label = QLabel(
+            f"需要向用户 {open_id[:20]}... 发送一条消息以获取会话 ID。\n"
+            "请编辑消息内容，并选择发送方式："
+        )
+        info_label.setWordWrap(True)
+        dlg_layout.addWidget(info_label)
+
+        # 消息内容输入框（可编辑）
+        dlg_layout.addWidget(QLabel("消息内容:"))
+        msg_edit = QTextEdit()
+        msg_edit.setMaximumHeight(80)
+        msg_edit.setPlainText("✅ New session started · model: vendor-claude-opus-4-5/aws-claude-opus-4-5")
+        msg_edit.setPlaceholderText("输入要发送的消息内容...")
+        dlg_layout.addWidget(msg_edit)
+
+        # 按钮区域
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        send_keep_btn = QPushButton("📤 发送消息")
+        send_keep_btn.setToolTip("发送消息并保留，获取会话 ID 后加载历史")
+        send_keep_btn.setDefault(True)
+        send_keep_btn.setStyleSheet(
+            "QPushButton { background: #1677ff; color: white; border: none; "
+            "border-radius: 4px; padding: 8px 16px; font-weight: bold; }"
+            "QPushButton:hover { background: #4096ff; }"
+        )
+        btn_layout.addWidget(send_keep_btn)
+
+        send_recall_btn = QPushButton("📤 发送并撤回")
+        send_recall_btn.setToolTip("发送消息获取会话 ID 后立即撤回该消息")
+        send_recall_btn.setStyleSheet(
+            "QPushButton { background: #faad14; color: white; border: none; "
+            "border-radius: 4px; padding: 8px 16px; font-weight: bold; }"
+            "QPushButton:hover { background: #ffc53d; }"
+        )
+        btn_layout.addWidget(send_recall_btn)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setStyleSheet(
+            "QPushButton { border: 1px solid #ddd; border-radius: 4px; padding: 8px 16px; }"
+            "QPushButton:hover { background: #f0f0f0; }"
+        )
+        btn_layout.addWidget(cancel_btn)
+
+        dlg_layout.addLayout(btn_layout)
+
+        # 用于存储用户选择结果
+        dialog._user_choice = None  # "send" | "recall" | None
+
+        def on_send_keep():
+            dialog._user_choice = "send"
+            dialog.accept()
+
+        def on_send_recall():
+            dialog._user_choice = "recall"
+            dialog.accept()
+
+        send_keep_btn.clicked.connect(on_send_keep)
+        send_recall_btn.clicked.connect(on_send_recall)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.Accepted or not dialog._user_choice:
+            return  # 用户取消
+
+        msg_content = msg_edit.toPlainText().strip()
+        if not msg_content:
+            msg_content = " "  # 至少发送一个空格
+
+        recall_after = dialog._user_choice == "recall"
+
+        # 开始发送
         self._current_chat_id = open_id
         self._current_chat_name = f"用户 {open_id[:16]}..."
         self._current_id_type = "open_id"
+        self._pending_recall = recall_after
+        self._pending_msg_content = msg_content
         self.chat_title_label.setText(f"📨 {self._current_chat_name}")
         self.chat_display.clear()
-        self.chat_display.setPlaceholderText(
-            f"已选择用户: {open_id}\n\n"
-            "未在已加载的会话列表中找到与该用户的单聊记录。\n\n"
-            "可能的原因：\n"
-            "• 机器人尚未与该用户建立过单聊\n"
-            "• 会话列表未加载或不完整\n\n"
-            "当前仍可发送消息给该用户。发送消息后将自动建立单聊，\n"
-            "重新加载会话列表即可查看历史消息。"
-        )
-        self.send_btn.setEnabled(True)
+        self.send_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
+
+        action_text = "发送并撤回" if recall_after else "发送消息"
+        self.status_label.setText(f"正在{action_text}以获取单聊会话 ID...")
+
+        worker = ApiWorker(
+            self._messages_api.send_text_message, open_id, msg_content, "open_id"
+        )
+        worker.finished.connect(lambda result: self._on_temp_msg_sent(result, open_id))
+        worker.error.connect(self._on_api_error)
+        self._start_new_worker(worker)
+
+    def _on_temp_msg_sent(self, result, open_id: str):
+        """消息发送成功，获取 chat_id，根据用户选择决定是否撤回"""
+        data = result.get("data", {})
+        msg_id = data.get("message_id", "")
+        chat_id = data.get("chat_id", "")
+
+        if not chat_id:
+            self.status_label.setText("❌ 未能获取 chat_id，请尝试手动发送消息")
+            self.send_btn.setEnabled(True)
+            return
+
+        # 更新联系人缓存中的 chat_id
+        if open_id in self._p2p_contacts:
+            self._p2p_contacts[open_id]["chat_id"] = chat_id
+
+        recall_after = getattr(self, '_pending_recall', True)
+
+        if recall_after and msg_id:
+            # 用户选择了"发送并撤回"
+            self.status_label.setText(f"已获取 chat_id，正在撤回消息...")
+            worker = ApiWorker(self._messages_api.delete_message, msg_id)
+            worker.finished.connect(lambda _res: self._on_temp_msg_done(chat_id, open_id, recalled=True))
+            worker.error.connect(lambda _err: self._on_temp_msg_done(chat_id, open_id, recalled=False))
+            self._start_new_worker(worker)
+        else:
+            # 用户选择了"发送消息"（保留），直接加载历史
+            self._on_temp_msg_done(chat_id, open_id, recalled=False)
+
+    def _on_temp_msg_done(self, chat_id: str, open_id: str, recalled: bool = False):
+        """消息处理完成（发送/撤回），打开会话并加载历史"""
+        name = f"用户 {open_id[:16]}..."
+        contact = self._p2p_contacts.get(open_id)
+        if contact and contact.get("name"):
+            name = contact["name"]
+
+        action_desc = "已撤回消息" if recalled else "已发送消息"
+        self.status_label.setText(
+            f"✅ {action_desc}，获取单聊会话 (chat_id: {chat_id[:16]}...)"
+        )
+        self._open_chat(chat_id, f"👤 {name}")
 
     def _open_chat(self, chat_id: str, chat_name: str):
         """打开一个聊天会话"""
@@ -641,14 +844,14 @@ class MessagesTab(QWidget):
         self.status_label.setText("正在加载历史消息...")
         self.refresh_btn.setEnabled(False)
 
-        self._worker = ApiWorker(
+        worker = ApiWorker(
             self._messages_api.get_all_chat_messages,
             self._current_chat_id,
             max_count=100,
         )
-        self._worker.finished.connect(self._on_messages_loaded)
-        self._worker.error.connect(self._on_api_error)
-        self._worker.start()
+        worker.finished.connect(self._on_messages_loaded)
+        worker.error.connect(self._on_api_error)
+        self._start_new_worker(worker)
 
     @staticmethod
     def _escape_html(text: str) -> str:
@@ -699,12 +902,17 @@ class MessagesTab(QWidget):
             sender_id = sender.get("id", "未知")
             create_time = msg.get("create_time", "")
 
-            # 时间戳转可读时间
+            # 时间戳转可读时间（固定 UTC+8 中国时间）
             time_str = ""
             if create_time:
                 try:
-                    ts = int(create_time) / 1000  # 毫秒 -> 秒
-                    time_str = time.strftime("%m-%d %H:%M", time.localtime(ts))
+                    ts_val = int(create_time)
+                    # 自动判断秒级(10位)或毫秒级(13位)时间戳
+                    if ts_val > 1e12:
+                        ts_val = ts_val / 1000  # 毫秒 -> 秒
+                    cn_tz = timezone(timedelta(hours=8))
+                    dt = datetime.fromtimestamp(ts_val, tz=cn_tz)
+                    time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
                 except (ValueError, OSError):
                     time_str = create_time
 
@@ -788,14 +996,14 @@ class MessagesTab(QWidget):
 
         if msg_type_index == 0:
             # 文本消息
-            self._worker = ApiWorker(
+            worker = ApiWorker(
                 self._messages_api.send_text_message, receive_id, content, receive_id_type
             )
         elif msg_type_index == 1:
             # 富文本消息
             title = self.title_input.text().strip()
             post_content = text_to_post(content, title)
-            self._worker = ApiWorker(
+            worker = ApiWorker(
                 self._messages_api.send_rich_text_message, receive_id, post_content, receive_id_type
             )
         elif msg_type_index == 2:
@@ -807,22 +1015,25 @@ class MessagesTab(QWidget):
                 self.send_btn.setEnabled(True)
                 self.status_label.setText("就绪")
                 return
-            self._worker = ApiWorker(
+            worker = ApiWorker(
                 self._messages_api.send_interactive_message, receive_id, card_content, receive_id_type
             )
 
-        self._worker.finished.connect(self._on_send_result)
-        self._worker.error.connect(self._on_api_error)
-        self._worker.start()
+        worker.finished.connect(self._on_send_result)
+        worker.error.connect(self._on_api_error)
+        self._start_new_worker(worker)
 
     def _on_send_result(self, result):
         """发送结果"""
         self.send_btn.setEnabled(True)
-        msg_id = result.get("data", {}).get("message_id", "未知")
+        data = result.get("data", {})
+        msg_id = data.get("message_id", "未知")
+        response_chat_id = data.get("chat_id", "")
 
         # 在聊天框中以 HTML 格式追加发送的消息
         content = self.msg_input.toPlainText().strip()
-        now_str = time.strftime("%m-%d %H:%M", time.localtime())
+        cn_tz = timezone(timedelta(hours=8))
+        now_str = datetime.now(tz=cn_tz).strftime("%Y-%m-%d %H:%M:%S")
         msg_html = self._format_message_html(now_str, "🤖 我（应用）", content, is_app=True)
         # 移动到末尾并插入 HTML
         cursor = self.chat_display.textCursor()
@@ -838,6 +1049,32 @@ class MessagesTab(QWidget):
         self.msg_input.clear()
 
         self.status_label.setText(f"✅ 发送成功 (ID: {msg_id[:16]}...)")
+
+        # 如果当前不是 chat_id 模式，但响应中返回了 chat_id，
+        # 自动切换为 chat_id 模式并加载历史消息
+        current_id_type = getattr(self, '_current_id_type', 'chat_id')
+        if current_id_type != "chat_id" and response_chat_id:
+            # 保存当前 open_id 用于更新缓存
+            prev_open_id = self._current_chat_id
+
+            self.status_label.setText(
+                f"✅ 发送成功 - 已获取单聊会话 ID: {response_chat_id[:16]}..."
+            )
+            # 切换到 chat_id 模式
+            self._current_chat_id = response_chat_id
+            self._current_id_type = "chat_id"
+            self._current_chat_name = f"👤 单聊 {response_chat_id[:12]}..."
+            self.chat_title_label.setText(f"💬 {self._current_chat_name}")
+            self.manual_id_input.setText(response_chat_id)
+            self.receive_type_combo.setCurrentIndex(0)
+            self.refresh_btn.setEnabled(True)
+
+            # 更新联系人缓存中的 chat_id（下次点击可直接加载历史）
+            if prev_open_id and prev_open_id in self._p2p_contacts:
+                self._p2p_contacts[prev_open_id]["chat_id"] = response_chat_id
+
+            # 自动加载历史消息（延迟 500ms 让 UI 更新）
+            QTimer.singleShot(500, self._load_messages)
 
     # ─── 错误处理 ─────────────────────
 

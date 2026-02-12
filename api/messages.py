@@ -202,6 +202,15 @@ class MessagesAPI:
 
         return all_members
 
+    def delete_message(self, message_id: str) -> dict:
+        """
+        撤回消息
+
+        :param message_id: 消息 ID
+        :return: API 响应数据
+        """
+        return self.auth.request("DELETE", f"/im/v1/messages/{message_id}")
+
     def reply_message(self, message_id: str, msg_type: str, content: str) -> dict:
         """
         回复消息
